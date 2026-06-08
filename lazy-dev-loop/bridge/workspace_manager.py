@@ -46,7 +46,7 @@ def set_workspace(win_path: str) -> dict:
         cmd.extend(["-d", config.WSL_DISTRO])
     cmd.extend(["bash", "-ic", f'test -d {shlex.quote(wsl_path)} && echo OK || echo NOT_FOUND'])
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        result = subprocess.run(cmd, capture_output=True, encoding='utf-8', timeout=10)
         if "OK" not in result.stdout.strip():
             return {"success": False, "error": f"Directory not found or inaccessible: {win_path}"}
     except Exception as e:

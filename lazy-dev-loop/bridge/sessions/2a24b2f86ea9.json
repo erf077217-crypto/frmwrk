@@ -1,0 +1,16 @@
+{
+  "session_id": "2a24b2f86ea9",
+  "workspace": {
+    "workspace": "C:\\Users\\eb.sarmadi\\Desktop\\ai-framework",
+    "wsl_path": "/mnt/c/Users/eb.sarmadi/Desktop/ai-framework"
+  },
+  "port": 0,
+  "model": "default",
+  "started_at": "2026-06-08T13:16:56.181607+00:00",
+  "finished_at": null,
+  "archived": false,
+  "metadata": {
+    "total_prompts": 0
+  },
+  "messages": []
+}

@@ -14,7 +14,7 @@ def run_opencode(prompt: str, timeout: int | None = None) -> dict:
         result = subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
+            encoding='utf-8',
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
@@ -79,7 +79,7 @@ def find_opencode_path() -> str | None:
     for candidate in candidates:
         cmd = _build_wsl_cmd(candidate)
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            result = subprocess.run(cmd, capture_output=True, encoding='utf-8', timeout=10)
             path = result.stdout.strip()
             if path:
                 return path
@@ -129,7 +129,7 @@ def run_diagnostics() -> dict:
 def _run_wsl(command: str, shell_flag: str | None = None) -> dict:
     cmd = _build_wsl_cmd(command, shell_flag=shell_flag)
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        result = subprocess.run(cmd, capture_output=True, encoding='utf-8', timeout=10)
         return {
             "stdout": result.stdout.strip(),
             "stderr": result.stderr.strip(),

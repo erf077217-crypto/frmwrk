@@ -9,30 +9,35 @@ Windows
 ┌──────────────────────────────────────────────────────────┐
 │  Chrome Side Panel                                       │
 │  ┌──────────────────┐  ┌──────────────┐  ┌──────────┐   │
-│  │ Prompt + Response │  │ Workspace    │  │ Session  │   │
-│  │ (ANSI-stripped)   │  │ Path display │  │ Status   │   │
-│  │ Insert to ChatGPT │  │ Change btn   │  │ PID,Port │   │
-│  └────────┬─────────┘  └──────────────┘  │ Start/   │   │
-│           │  HTTP POST                    │ Stop     │   │
-│           ▼  /session/prompt              │ Open     │   │
-│           │                               │ Terminal │   │
-│           ▼                               └──────────┘   │
+│  │ Prompt + Response │  │ Saved        │  │ Session  │   │
+│  │ (ANSI-stripped)   │  │ Sessions     │  │ Status   │   │
+│  │ Insert to ChatGPT │  │ (Load/       │  │ (tmux)  │   │
+│  └────────┬─────────┘  │ Archive)     │  │ Start/   │   │
+│           │  HTTP POST │              │  │ Stop     │   │
+│           ▼  /session/ │  Workspace   │  │ Open     │   │
+│           │   prompt   │  Selector    │  │ Terminal │   │
+│           ▼            └──────────────┘  └──────────┘   │
 │   FastAPI Bridge (Windows Python)                         │
-│   opencode_session.py    workspace_manager.py             │
-│         │                                                   │
-│   1. Start: wsl.exe bash -ic "opencode serve --port N"   │
-│   2. Prompt: wsl.exe bash -ic "opencode run --attach …"  │
-│   3. Term:   wsl.exe bash -ic "opencode attach …"        │
+│   tmux_session.py   workspace_manager.py                  │
+│   session_store.py                                        │
+│         │                                                  │
+│    tmux send-keys / tmux capture-pane / tmux attach       │
+│    via: wsl.exe bash -ic "tmux <cmd>"                    │
 └────────────────────┬─────────────────────────────────────┘
                       │
                WSL ───┘
 ┌──────────────────────────────────────────────────────────┐
-│  opencode serve --port 14096  (persistent server)       │
-│    └── holds session state, repo context, history        │
-│  opencode run --attach http://localhost:14096 'prompt'   │
-│    └── sends prompt, returns response, exits             │
-│  opencode attach http://localhost:14096                  │
-│    └── interactive TUI connected to the running session │
+│  wsl.exe bash -c "tmux new-session -s lazy-dev-loop"    │
+│    └── runs opencode (TUI, not serve) inside tmux pane   │
+│                                                           │
+│  tmux send-keys -t lazy-dev-loop '<prompt>' Enter        │
+│    └── injects prompt directly into the single process   │
+│                                                           │
+│  tmux capture-pane -t lazy-dev-loop -p                   │
+│    └── reads pane output (polled for stable response)    │
+│                                                           │
+│  tmux attach -t lazy-dev-loop                            │
+│    └── terminal attaches to EXACT same tmux session      │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -54,9 +59,10 @@ lazy-dev-loop/
 ├── bridge/                 # Python FastAPI bridge service
 │   ├── main.py
 │   ├── config.py
-│   ├── opencode_runner.py  # Legacy one-shot subprocess runner
-│   ├── session_manager.py  # Legacy async session manager (backward compat)
-│   ├── opencode_session.py # Persistent OpenCode session via `serve + attach`
+│   ├── opencode_runner.py  # One-shot subprocess runner (/prompt, /health, /diagnostics)
+│   ├── tmux_session.py     # Tmux-backed session manager (authoritative)
+│   ├── opencode_session.py # Thin re-export shim for tmux_session (backward compat)
+│   ├── session_store.py    # Session persistence to disk (backup)
 │   ├── workspace_manager.py# Workspace management (Windows→WSL path conversion)
 │   ├── workspace.json      # Persisted active workspace path
 │   ├── run.sh              # Startup script (Git Bash / WSL)
