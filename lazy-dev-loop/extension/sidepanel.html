@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Lazy Developer Loop</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, sans-serif;
+      background: #1e1e2e;
+      color: #cdd6f4;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+    h1 {
+      font-size: 15px;
+      color: #cba6f7;
+      margin-bottom: 10px;
+      flex-shrink: 0;
+    }
+
+    section {
+      flex-shrink: 0;
+      margin-bottom: 8px;
+    }
+    section h3 {
+      font-size: 12px;
+      color: #a6adc8;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 4px;
+    }
+
+    textarea {
+      width: 100%;
+      background: #313244;
+      border: 1px solid #45475a;
+      border-radius: 6px;
+      padding: 8px;
+      font-size: 13px;
+      font-family: inherit;
+      color: #cdd6f4;
+      resize: vertical;
+      outline: none;
+    }
+    textarea:focus { border-color: #cba6f7; }
+    textarea::selection { background: #cba6f7; color: #1e1e2e; }
+
+    input[type="text"] {
+      width: 100%;
+      background: #313244;
+      border: 1px solid #45475a;
+      border-radius: 6px;
+      padding: 6px 8px;
+      font-size: 12px;
+      font-family: inherit;
+      color: #cdd6f4;
+      outline: none;
+    }
+    input[type="text"]:focus { border-color: #cba6f7; }
+
+    .btn-row {
+      display: flex;
+      gap: 6px;
+      margin-top: 6px;
+    }
+    button {
+      flex: 1;
+      padding: 7px 0;
+      border: none;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button.primary {
+      background: #cba6f7;
+      color: #1e1e2e;
+    }
+    button.primary:hover { background: #b4befe; }
+    button.secondary {
+      background: #45475a;
+      color: #cdd6f4;
+    }
+    button.secondary:hover { background: #585b70; }
+    button.accent {
+      background: #89b4fa;
+      color: #1e1e2e;
+    }
+    button.accent:hover { background: #b4befe; }
+    button.danger {
+      background: #f38ba8;
+      color: #1e1e2e;
+    }
+    button.danger:hover { background: #eba0ac; }
+    button:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+
+    .viewer {
+      background: #313244;
+      border: 1px solid #45475a;
+      border-radius: 6px;
+      padding: 8px;
+      font-size: 12px;
+      font-family: 'Consolas', 'Cascadia Code', 'Fira Code', monospace;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+      overflow-y: auto;
+      min-height: 48px;
+      max-height: 200px;
+    }
+
+    #promptSection textarea { min-height: 52px; max-height: 120px; }
+
+    #responseSection { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+    #responseSection .viewer { flex: 1; max-height: none; }
+
+    .info-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 11px;
+      color: #a6adc8;
+      padding: 4px 0;
+    }
+    .info-row .label { color: #6c7086; }
+    .info-row .value { color: #cdd6f4; font-family: monospace; font-size: 11px; }
+    .info-panel {
+      background: #313244;
+      border: 1px solid #45475a;
+      border-radius: 6px;
+      padding: 8px;
+      font-size: 11px;
+    }
+    .info-panel .info-row + .info-row { border-top: 1px solid #45475a; }
+
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-size: 10px;
+      font-weight: 600;
+    }
+    .badge-active { background: #a6e3a1; color: #1e1e2e; }
+    .badge-inactive { background: #45475a; color: #a6adc8; }
+
+    #status {
+      flex-shrink: 0;
+      font-size: 11px;
+      min-height: 18px;
+      text-align: center;
+      color: #6c7086;
+    }
+    .status-ok   { color: #a6e3a1; }
+    .status-err  { color: #f38ba8; }
+    .status-info { color: #89b4fa; }
+
+    details {
+      flex-shrink: 0;
+      margin-top: 4px;
+    }
+    details summary {
+      cursor: pointer;
+      color: #6c7086;
+      font-size: 11px;
+    }
+    .debug-row {
+      display: flex;
+      gap: 6px;
+      margin-top: 4px;
+    }
+    .debug-row button {
+      flex: 1;
+      padding: 4px;
+      font-size: 10px;
+      background: #313244;
+      color: #a6adc8;
+    }
+    #debugLog {
+      margin-top: 4px;
+      background: #11111b;
+      border-radius: 4px;
+      padding: 6px;
+      font-size: 10px;
+      font-family: monospace;
+      line-height: 1.3;
+      white-space: pre-wrap;
+      max-height: 80px;
+      overflow-y: auto;
+      color: #6c7086;
+    }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+
+  <h1>Lazy Developer Loop</h1>
+
+  <!-- Prompt -->
+  <section id="promptSection">
+    <h3>Prompt</h3>
+    <textarea id="promptInput" placeholder="Type or paste a prompt here…"></textarea>
+    <div class="btn-row">
+      <button class="primary" id="sendBtn">Send to OpenCode</button>
+    </div>
+  </section>
+
+  <!-- Response -->
+  <section id="responseSection">
+    <h3>Response</h3>
+    <div class="viewer" id="responseViewer">(run a prompt to see the response)</div>
+    <div class="btn-row" id="insertRow">
+      <button class="secondary" id="insertBtn" disabled>Insert Into ChatGPT</button>
+    </div>
+  </section>
+
+  <!-- Workspace -->
+  <section id="workspaceSection">
+    <h3>Workspace</h3>
+    <div class="info-panel" id="workspacePanel">
+      <div class="info-row">
+        <span class="label">Path:</span>
+        <span class="value" id="workspacePath">(not set)</span>
+      </div>
+      <div id="workspaceEditRow" class="hidden" style="margin-top: 6px;">
+        <input type="text" id="workspaceInput" placeholder="C:\path\to\repo">
+        <div class="btn-row">
+          <button class="secondary" id="workspaceSetBtn">Set</button>
+          <button class="secondary" id="workspaceCancelBtn">Cancel</button>
+        </div>
+      </div>
+      <button class="secondary" id="workspaceChangeBtn" style="margin-top: 6px; width: 100%;">Change Workspace</button>
+    </div>
+  </section>
+
+  <!-- Session -->
+  <section id="sessionSection">
+    <h3>Session</h3>
+    <div class="info-panel" id="sessionPanel">
+      <div class="info-row">
+        <span class="label">State:</span>
+        <span class="value"><span class="badge badge-inactive" id="sessionState">Inactive</span></span>
+      </div>
+      <div class="info-row">
+        <span class="label">Session ID:</span>
+        <span class="value" id="sessionId">—</span>
+      </div>
+      <div class="info-row">
+        <span class="label">PID:</span>
+        <span class="value" id="sessionPid">—</span>
+      </div>
+      <div class="info-row">
+        <span class="label">Uptime:</span>
+        <span class="value" id="sessionUptime">—</span>
+      </div>
+      <div class="info-row">
+        <span class="label">Port:</span>
+        <span class="value" id="sessionPort">—</span>
+      </div>
+      <div class="btn-row" style="margin-top: 6px;">
+        <button class="primary" id="sessionStartBtn">Start Session</button>
+        <button class="danger" id="sessionStopBtn" disabled>Stop Session</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Terminal -->
+  <section id="terminalSection">
+    <div class="btn-row">
+      <button class="accent" id="openTerminalBtn" disabled>Open Terminal</button>
+    </div>
+  </section>
+
+  <div id="status">Ready</div>
+
+  <!-- Diagnostics -->
+  <details>
+    <summary>Diagnostics</summary>
+    <div class="debug-row">
+      <button id="pingBtn">Ping ChatGPT</button>
+      <button id="tabInfoBtn">Tab Info</button>
+      <button id="refreshBtn">Refresh Status</button>
+    </div>
+    <div id="debugLog" class="hidden"></div>
+  </details>
+
+  <script src="sidepanel.js"></script>
+</body>
+</html>
