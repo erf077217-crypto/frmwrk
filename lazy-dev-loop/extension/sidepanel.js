@@ -25,6 +25,7 @@ const mgmtWorkspacePath  = document.getElementById("mgmtWorkspacePath");
 const mgmtSessionState   = document.getElementById("mgmtSessionState");
 const mgmtSessionId      = document.getElementById("mgmtSessionId");
 const mgmtSessionUptime  = document.getElementById("mgmtSessionUptime");
+const mgmtSessionSource  = document.getElementById("mgmtSessionSource");
 const mgmtOpenTerminalBtn= document.getElementById("mgmtOpenTerminalBtn");
 
 // Page 2 — active session
@@ -88,6 +89,7 @@ function applySessionStatus(data) {
   mgmtSessionState.className = `badge badge-${active ? "active" : "inactive"}`;
   mgmtSessionId.textContent = data.session_id || "—";
   mgmtOpenTerminalBtn.disabled = !active;
+  mgmtSessionSource.textContent = data.source || "bridge";
 
   if (data.uptime != null) {
     const secs = Math.floor(data.uptime);
@@ -234,20 +236,18 @@ function renderSavedSessions(sessions) {
     return;
   }
   savedSessionList.innerHTML = sessions
-    .filter((s) => !s.archived)
     .slice(0, 20)
     .map((s) => {
-      const date = s.started_at
-        ? new Date(s.started_at).toLocaleDateString()
-        : "?";
+      const title = s.title || s.session_id;
+      const updated = s.updated || "?";
       return `<div class="session-list-item">
         <div>
-          <div class="sli-id">${s.session_id}</div>
-          <div class="sli-meta">${date} · ${s.total_prompts || 0} prompts</div>
+          <div class="sli-id" title="${s.session_id}">${title}</div>
+          <div class="sli-meta">${s.session_id}</div>
+          <div class="sli-meta">${updated} · from OpenCode</div>
         </div>
         <div class="sli-actions">
           <button class="secondary" data-load="${s.session_id}">Load</button>
-          <button class="secondary" data-archive="${s.session_id}">Archive</button>
         </div>
       </div>`;
     })
@@ -255,9 +255,6 @@ function renderSavedSessions(sessions) {
 
   savedSessionList.querySelectorAll("[data-load]").forEach((btn) => {
     btn.addEventListener("click", () => loadSession(btn.dataset.load));
-  });
-  savedSessionList.querySelectorAll("[data-archive]").forEach((btn) => {
-    btn.addEventListener("click", () => archiveSession(btn.dataset.archive));
   });
 }
 
@@ -277,16 +274,6 @@ async function loadSession(sessionId) {
     }
   } catch (err) {
     setStatus(`Error: ${err.message}`, "status-err");
-  }
-}
-
-async function archiveSession(sessionId) {
-  debug(`Archiving: ${sessionId}`);
-  try {
-    await fetch(`${BRIDGE}/sessions/archive/${sessionId}`, { method: "POST" });
-    await fetchSavedSessions();
-  } catch (err) {
-    debug(`Archive error: ${err.message}`);
   }
 }
 

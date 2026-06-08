@@ -1,11 +1,10 @@
+import json
 import re
 import shlex
 import subprocess
 import time
-import uuid
 
 import config
-import session_store as ss
 import workspace_manager as wm
 
 _ANSI_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
@@ -17,7 +16,6 @@ def strip_ansi(text: str) -> str:
 
 
 def check_tmux() -> bool:
-    """Verify tmux is available inside WSL."""
     cmd = _wsl_cmd("command -v tmux")
     try:
         result = subprocess.run(cmd, capture_output=True, encoding='utf-8', timeout=10)
@@ -49,17 +47,10 @@ def _ensure_tmux() -> bool:
 
 
 def _escape_single_quotes(text: str) -> str:
-    """Escape text for use inside bash single quotes.
-
-    In single quotes the only character that cannot appear is a single
-    quote itself.  The trick is: end the quote, add an escaped quote,
-    then restart the quote.
-    """
     return text.replace("'", "'\\''")
 
 
 def _capture_pane() -> str:
-    """Read current tmux pane content."""
     stdout, _, _ = _tmux(f"capture-pane -t {TMUX_SESSION_NAME} -p")
     return stdout or ""
 
@@ -81,22 +72,92 @@ def _tmux(tmux_args: str) -> tuple[str, str, int]:
         return "", "wsl.exe not found", -1
 
 
-class TmuxSession:
-    """Manages a single OpenCode TUI process inside a named tmux session.
+def _opencode_cli(*args: str) -> tuple[str, str, int]:
+    inner = " ".join(shlex.quote(a) for a in args)
+    cmd = _wsl_cmd(f"cd /tmp && {config.OPENCODE_COMMAND} {inner} 2>/dev/null")
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            encoding='utf-8',
+            timeout=30,
+        )
+        return result.stdout, result.stderr, result.returncode
+    except subprocess.TimeoutExpired:
+        return "", "timeout", -1
+    except FileNotFoundError:
+        return "", "wsl.exe not found", -1
 
-    The tmux session becomes the single source of truth.  Both the
-    bridge (extension prompts) and the OS terminal attach to the *same*
-    tmux session, guaranteeing shared state.
-    """
+
+def _list_session_ids() -> set[str]:
+    stdout, _, _ = _opencode_cli("session", "list")
+    if not stdout:
+        return set()
+    return set(re.findall(r'ses_[a-zA-Z0-9]+', stdout))
+
+
+def _session_list() -> list[dict]:
+    stdout, _, rc = _opencode_cli("session", "list")
+    if rc != 0 or not stdout:
+        return []
+    sessions = []
+    for line in stdout.strip().split("\n")[2:]:
+        if not line.strip():
+            continue
+        parts = line.strip().split(None, 1)
+        sid = parts[0]
+        rest = parts[1] if len(parts) > 1 else ""
+        title = rest
+        updated = ""
+        if "  " in rest:
+            idx = rest.rfind("  ")
+            title = rest[:idx]
+            updated = rest[idx:].strip()
+            sessions.append({
+                "session_id": sid,
+                "title": title.strip(),
+            "updated": updated,
+            "source": "opencode",
+        })
+    return sessions
+
+
+def _session_export(session_id: str) -> dict | None:
+    stdout, _, rc = _opencode_cli("export", session_id)
+    if rc != 0 or not stdout:
+        return None
+    lines = stdout.split("\n")
+    if lines and lines[0].startswith("Exporting session"):
+        stdout = "\n".join(lines[1:])
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+    info = data.get("info", {})
+    messages = data.get("messages", [])
+    return {
+        "session_id": info.get("id"),
+        "title": info.get("title"),
+        "slug": info.get("slug"),
+        "workspace": info.get("directory"),
+        "agent": info.get("agent"),
+        "model": info.get("model"),
+        "tokens": info.get("tokens"),
+        "cost": info.get("cost"),
+        "time": info.get("time"),
+        "messages": messages,
+        "source": "opencode",
+    }
+
+
+class TmuxSession:
 
     def __init__(self):
-        self.session_id: str | None = None
+        self.oc_session_id: str | None = None
         self.started_at: float | None = None
         self.prompt_count: int = 0
         self._last_capture: str = ""
         self.finished: bool = False
-
-    # ── public helpers ---------------------------------------------------
 
     @property
     def active(self) -> bool:
@@ -110,7 +171,7 @@ class TmuxSession:
 
     # ── lifecycle --------------------------------------------------------
 
-    def start(self) -> dict:
+    def start(self, session_id: str | None = None) -> dict:
         if not _ensure_tmux():
             return {
                 "success": False,
@@ -131,9 +192,16 @@ class TmuxSession:
 
         _tmux(f"kill-session -t {TMUX_SESSION_NAME} 2>/dev/null")
 
-        opencode_cmd = f"cd {shlex.quote(wsl_path)} && {config.OPENCODE_COMMAND}"
+        flag = ""
+        if session_id:
+            flag = f"--session {shlex.quote(session_id)}"
+
+        opencode_cmd = (
+            f"cd {shlex.quote(wsl_path)} && "
+            f"{config.OPENCODE_COMMAND} {flag}".strip()
+        )
         create_out = _tmux(
-            f'new-session -d -s {TMUX_SESSION_NAME} {shlex.quote(opencode_cmd)}'
+            f"new-session -d -s {TMUX_SESSION_NAME} {shlex.quote(opencode_cmd)}"
         )
 
         time.sleep(3)
@@ -144,28 +212,24 @@ class TmuxSession:
                 "error": f"tmux session failed to start: {create_out[1][:200]}",
             }
 
-        self.session_id = uuid.uuid4().hex[:12]
+        self.oc_session_id = session_id or None
         self.started_at = time.time()
         self.prompt_count = 0
         self.finished = False
         self._last_capture = _capture_pane()
 
-        ss.create_session(self.session_id, ws, 0)
-
         return {
             "success": True,
-            "session_id": self.session_id,
+            "session_id": session_id or None,
             "session_name": TMUX_SESSION_NAME,
         }
 
     def stop(self) -> dict:
         _tmux(f"kill-session -t {TMUX_SESSION_NAME} 2>/dev/null")
         self.finished = True
-        if self.session_id:
-            ss.finalize_session(self.session_id)
         return {
             "success": True,
-            "session_id": self.session_id,
+            "session_id": self.oc_session_id,
         }
 
     # ── prompt -----------------------------------------------------------
@@ -184,13 +248,8 @@ class TmuxSession:
 
         output = self._wait_for_stable_output(before)
 
-        # Persist
         cleaned_prompt = strip_ansi(prompt).strip()
         clean_output = strip_ansi(output).strip()
-
-        if self.session_id:
-            ss.append_message(self.session_id, "user", cleaned_prompt)
-            ss.append_message(self.session_id, "assistant", clean_output)
 
         self.prompt_count += 1
         self._last_capture = _capture_pane()
@@ -202,10 +261,6 @@ class TmuxSession:
         }
 
     def _wait_for_stable_output(self, before: str, timeout: int | None = None) -> str:
-        """Block until the tmux pane content stabilises (no change for 1.5 s).
-
-        Returns the *new* content (everything added after *before*).
-        """
         deadline = time.time() + (timeout or config.RUN_TIMEOUT)
         last_output = before
         stable_since: float | None = None
@@ -227,10 +282,10 @@ class TmuxSession:
     @staticmethod
     def _extract_new(before: str, after: str) -> str:
         if after.startswith(before):
-            return after[len(before) :]
+            return after[len(before):]
         idx = after.find(before)
         if idx >= 0:
-            return after[idx + len(before) :]
+            return after[idx + len(before):]
         return after
 
     # ── status / info ----------------------------------------------------
@@ -240,7 +295,7 @@ class TmuxSession:
         wsl_workspace = wm.get_workspace()
         return {
             "active": active and not self.finished,
-            "session_id": self.session_id,
+            "session_id": self.oc_session_id,
             "session_name": TMUX_SESSION_NAME,
             "uptime": self.uptime,
             "started_at": (
@@ -250,10 +305,10 @@ class TmuxSession:
             ),
             "prompt_count": self.prompt_count,
             "workspace": wsl_workspace,
+            "source": "opencode",
         }
 
     def pane_preview(self, max_lines: int = 5) -> str:
-        """Return the last *max_lines* lines of the pane (ANSI-stripped)."""
         if not self.active:
             return ""
         content = _capture_pane()
@@ -282,7 +337,7 @@ class TmuxSession:
         try:
             creationflags = 0
             if hasattr(subprocess, "CREATE_NEW_CONSOLE"):
-                creationflags = subprocess.CREATE_NEW_CONSOLE  # 16
+                creationflags = subprocess.CREATE_NEW_CONSOLE
             subprocess.Popen(cmd, creationflags=creationflags)
             return {"success": True, "message": "Terminal launched"}
         except Exception as e:
@@ -298,13 +353,13 @@ def get_active() -> TmuxSession:
     return _active
 
 
-async def start_session() -> dict:
+async def start_session(session_id: str | None = None) -> dict:
     if _active.active and not _active.finished:
         return {
             "success": False,
             "error": "Session already active. Stop it first.",
         }
-    return _active.start()
+    return _active.start(session_id)
 
 
 async def stop_session() -> dict:
@@ -323,31 +378,15 @@ def open_terminal() -> dict:
     return _active.open_terminal()
 
 
-def list_saved_sessions() -> list[dict]:
-    return ss.list_sessions()
+def list_sessions() -> list[dict]:
+    return _session_list()
 
 
-def get_saved_session(session_id: str) -> dict | None:
-    return ss.get_session(session_id)
-
-
-def archive_saved_session(session_id: str) -> dict:
-    ok = ss.archive_session(session_id)
-    if not ok:
-        return {"success": False, "error": "Session not found"}
-    return {"success": True, "session_id": session_id}
+def get_session(session_id: str) -> dict | None:
+    return _session_export(session_id)
 
 
 async def load_session(session_id: str) -> dict:
-    saved = ss.get_session(session_id)
-    if not saved:
-        return {"success": False, "error": "Session not found"}
-
     if _active.active and not _active.finished:
         await _active.stop()
-
-    ws_path = saved.get("workspace", {}).get("workspace")
-    if ws_path:
-        wm.set_workspace(ws_path)
-
-    return _active.start()
+    return _active.start(session_id=session_id)

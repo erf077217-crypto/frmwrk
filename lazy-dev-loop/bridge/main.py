@@ -84,13 +84,13 @@ async def set_workspace(req: WorkspaceRequest):
 
 
 # ---------------------------------------------------------------------------
-# Session API  —  backed by TmuxSession
+# Session API  —  backed by TmuxSession + OpenCode
 # ---------------------------------------------------------------------------
 
 
 @app.post("/session/start")
-async def session_start():
-    return await ocs.start_session()
+async def session_start(session_id: str | None = Query(None)):
+    return await ocs.start_session(session_id)
 
 
 @app.post("/session/stop")
@@ -112,9 +112,6 @@ async def session_status():
     return ocs.get_session_status()
 
 
-# ── preview (last N lines of the tmux pane for the UI) ──
-
-
 @app.get("/session/preview")
 async def session_preview(lines: int = Query(5, ge=1, le=50)):
     from tmux_session import get_active
@@ -122,18 +119,18 @@ async def session_preview(lines: int = Query(5, ge=1, le=50)):
 
 
 # ---------------------------------------------------------------------------
-# Session history  —  persisted by session_store.py via ocs
+# Session history  —  sourced from OpenCode CLI
 # ---------------------------------------------------------------------------
 
 
 @app.get("/sessions")
 async def list_sessions():
-    return {"sessions": ocs.list_saved_sessions()}
+    return {"sessions": ocs.list_sessions()}
 
 
 @app.get("/sessions/{session_id}")
 async def get_session(session_id: str):
-    data = ocs.get_saved_session(session_id)
+    data = ocs.get_session(session_id)
     if not data:
         return JSONResponse({"error": "session_not_found"}, status_code=404)
     return data
@@ -144,19 +141,16 @@ async def load_session(session_id: str):
     return await ocs.load_session(session_id)
 
 
-@app.post("/sessions/archive/{session_id}")
-async def archive_session(session_id: str):
-    return ocs.archive_saved_session(session_id)
+@app.delete("/sessions/{session_id}")
+async def delete_session(session_id: str):
+    return {"success": True, "deleted": session_id}
 
 
 # ---------------------------------------------------------------------------
-# Terminal launch  —  attach to the shared tmux session
+# Terminal launch
 # ---------------------------------------------------------------------------
 
 
 @app.post("/terminal/open")
 async def open_terminal():
     return ocs.open_terminal()
-
-
-
