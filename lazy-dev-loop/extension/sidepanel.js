@@ -248,6 +248,7 @@ function renderSavedSessions(sessions) {
         </div>
         <div class="sli-actions">
           <button class="secondary" data-load="${s.session_id}">Load</button>
+          <button class="secondary" data-delete="${s.session_id}">Delete</button>
         </div>
       </div>`;
     })
@@ -255,6 +256,9 @@ function renderSavedSessions(sessions) {
 
   savedSessionList.querySelectorAll("[data-load]").forEach((btn) => {
     btn.addEventListener("click", () => loadSession(btn.dataset.load));
+  });
+  savedSessionList.querySelectorAll("[data-delete]").forEach((btn) => {
+    btn.addEventListener("click", () => deleteSession(btn.dataset.delete));
   });
 }
 
@@ -268,6 +272,23 @@ async function loadSession(sessionId) {
       setStatus("Session loaded", "status-ok");
       await fetchSessionStatus();
       showPage("active");
+      await fetchSavedSessions();
+    } else {
+      setStatus(`Error: ${data.error}`, "status-err");
+    }
+  } catch (err) {
+    setStatus(`Error: ${err.message}`, "status-err");
+  }
+}
+
+async function deleteSession(sessionId) {
+  if (!confirm(`Delete session ${sessionId}?`)) return;
+  debug(`Deleting session: ${sessionId}`);
+  try {
+    const r = await fetch(`${BRIDGE}/sessions/${sessionId}`, { method: "DELETE" });
+    const data = await r.json();
+    if (data.success) {
+      setStatus("Session deleted", "status-ok");
       await fetchSavedSessions();
     } else {
       setStatus(`Error: ${data.error}`, "status-err");

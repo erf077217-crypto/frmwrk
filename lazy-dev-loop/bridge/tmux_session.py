@@ -390,3 +390,10 @@ async def load_session(session_id: str) -> dict:
     if _active.active and not _active.finished:
         await _active.stop()
     return _active.start(session_id=session_id)
+
+
+def delete_session(session_id: str) -> dict:
+    stdout, stderr, rc = _opencode_cli("session", "delete", session_id)
+    if rc != 0:
+        return {"success": False, "error": stderr or "Delete failed"}
+    return {"success": True, "deleted": session_id}

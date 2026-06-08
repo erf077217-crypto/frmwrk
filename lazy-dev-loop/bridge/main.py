@@ -143,7 +143,7 @@ async def load_session(session_id: str):
 
 @app.delete("/sessions/{session_id}")
 async def delete_session(session_id: str):
-    return {"success": True, "deleted": session_id}
+    return ocs.delete_session(session_id)
 
 
 # ---------------------------------------------------------------------------

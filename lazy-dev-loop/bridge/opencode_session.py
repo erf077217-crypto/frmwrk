@@ -11,4 +11,5 @@ from tmux_session import (  # noqa: F401
     list_sessions,
     get_session,
     load_session,
+    delete_session,
 )
