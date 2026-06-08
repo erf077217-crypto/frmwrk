@@ -388,7 +388,7 @@ def get_session(session_id: str) -> dict | None:
 
 async def load_session(session_id: str) -> dict:
     if _active.active and not _active.finished:
-        await _active.stop()
+        _active.stop()
     return _active.start(session_id=session_id)
 
 
