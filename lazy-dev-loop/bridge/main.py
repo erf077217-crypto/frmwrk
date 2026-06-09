@@ -104,7 +104,13 @@ class SessionPromptRequest(BaseModel):
 
 @app.post("/session/prompt")
 async def session_prompt(req: SessionPromptRequest):
-    return await ocs.send_prompt(req.prompt)
+    prompt_id = ocs.start_prompt_background(req.prompt)
+    return {"prompt_id": prompt_id, "success": True}
+
+
+@app.get("/session/prompt-status/{prompt_id}")
+async def session_prompt_status(prompt_id: str):
+    return ocs.get_prompt_status(prompt_id)
 
 
 @app.get("/session/status")
@@ -154,3 +160,43 @@ async def delete_session(session_id: str):
 @app.post("/terminal/open")
 async def open_terminal():
     return ocs.open_terminal()
+
+
+# ---------------------------------------------------------------------------
+# Debug / diagnostics
+# ---------------------------------------------------------------------------
+
+
+@app.get("/debug/session")
+async def debug_session():
+    from tmux_session import _active, TMUX_SESSION_NAME, _session_export
+
+    oc_id = _active.oc_session_id
+    tmux_alive = _active.active
+    bridge_finished = _active.finished
+
+    opencode_data = None
+    if oc_id:
+        opencode_data = _session_export(oc_id)
+
+    return {
+        "opencode": {
+            "session_id": oc_id,
+            "export": opencode_data,
+        },
+        "tmux": {
+            "session_name": TMUX_SESSION_NAME,
+            "alive": tmux_alive,
+        },
+        "bridge": {
+            "session_id": oc_id,
+            "active_flag": tmux_alive,
+            "finished_flag": bridge_finished,
+            "started_at": _active.started_at,
+            "prompt_count": _active.prompt_count,
+        },
+        "ui": {
+            "shows_active": tmux_alive and not bridge_finished,
+        },
+        "workspace": wm.get_workspace(),
+    }

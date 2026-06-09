@@ -1,0 +1,26 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+*.egg-info
+
+# Node
+node_modules
+
+# Frontend build artifacts (not needed — rebuilt in container)
+frontend/dist
+
+# Environment files (secrets stay out of build context)
+.env
+**/.env
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo

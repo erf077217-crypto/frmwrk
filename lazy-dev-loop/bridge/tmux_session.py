@@ -1,8 +1,11 @@
+from collections.abc import Callable
 import json
 import re
 import shlex
 import subprocess
+import threading
 import time
+import uuid
 
 import config
 import workspace_manager as wm
@@ -191,6 +194,7 @@ class TmuxSession:
             }
 
         _tmux(f"kill-session -t {TMUX_SESSION_NAME} 2>/dev/null")
+        time.sleep(0.5)
 
         flag = ""
         if session_id:
@@ -204,15 +208,30 @@ class TmuxSession:
             f"new-session -d -s {TMUX_SESSION_NAME} {shlex.quote(opencode_cmd)}"
         )
 
+        if create_out[2] != 0:
+            return {
+                "success": False,
+                "error": (
+                    f"Failed to create tmux session: "
+                    f"{create_out[1][:200] or 'unknown error'}"
+                ),
+            }
+
         time.sleep(3)
 
         if not self.active:
             return {
                 "success": False,
-                "error": f"tmux session failed to start: {create_out[1][:200]}",
+                "error": f"Session died after creation: {create_out[1][:200]}",
             }
 
-        self.oc_session_id = session_id or None
+        if session_id:
+            self.oc_session_id = session_id
+        else:
+            pane = _capture_pane()
+            match = re.search(r'ses_[a-zA-Z0-9]+', pane)
+            self.oc_session_id = match.group(0) if match else None
+
         self.started_at = time.time()
         self.prompt_count = 0
         self.finished = False
@@ -220,12 +239,16 @@ class TmuxSession:
 
         return {
             "success": True,
-            "session_id": session_id or None,
+            "session_id": self.oc_session_id,
             "session_name": TMUX_SESSION_NAME,
         }
 
     def stop(self) -> dict:
         _tmux(f"kill-session -t {TMUX_SESSION_NAME} 2>/dev/null")
+        time.sleep(0.5)
+        if self.active:
+            _tmux(f"kill-session -t {TMUX_SESSION_NAME}")
+            time.sleep(0.5)
         self.finished = True
         return {
             "success": True,
@@ -248,36 +271,45 @@ class TmuxSession:
 
         output = self._wait_for_stable_output(before)
 
-        cleaned_prompt = strip_ansi(prompt).strip()
-        clean_output = strip_ansi(output).strip()
-
         self.prompt_count += 1
         self._last_capture = _capture_pane()
 
         return {
             "success": True,
-            "output": clean_output,
-            "raw": output,
+            "output": output.strip(),
         }
 
-    def _wait_for_stable_output(self, before: str, timeout: int | None = None) -> str:
-        deadline = time.time() + (timeout or config.RUN_TIMEOUT)
-        last_output = before
+    def _wait_for_stable_output(
+        self,
+        before: str,
+        on_progress: Callable[[str], None] | None = None,
+        timeout: int | None = None,
+    ) -> str:
+        max_idle = timeout or config.RUN_TIMEOUT
+        deadline = time.time() + max_idle
+        clean_before = strip_ansi(before)
+        clean_last = clean_before
         stable_since: float | None = None
 
         while time.time() < deadline:
             time.sleep(0.25)
             current = _capture_pane()
-            if current == last_output:
-                if stable_since is None:
-                    stable_since = time.time()
-                elif time.time() - stable_since >= 1.5:
+            clean_current = strip_ansi(current)
+
+            if on_progress and clean_current != clean_before:
+                new = self._extract_new(clean_before, clean_current)
+                if new:
+                    on_progress(_heuristic_filter(new.strip()))
+
+            if clean_current == clean_last:
+                if stable_since is not None and time.time() - stable_since >= 3.0:
                     break
             else:
-                last_output = current
-                stable_since = None
+                clean_last = clean_current
+                stable_since = time.time()
+                deadline = max(deadline, time.time() + max_idle)
 
-        return self._extract_new(before, last_output)
+        return self._extract_new(clean_before, clean_last)
 
     @staticmethod
     def _extract_new(before: str, after: str) -> str:
@@ -354,11 +386,13 @@ def get_active() -> TmuxSession:
 
 
 async def start_session(session_id: str | None = None) -> dict:
-    if _active.active and not _active.finished:
-        return {
-            "success": False,
-            "error": "Session already active. Stop it first.",
-        }
+    if _active.active:
+        if not _active.finished:
+            return {
+                "success": False,
+                "error": "Session already active. Stop it first.",
+            }
+        _active.stop()
     return _active.start(session_id)
 
 
@@ -397,3 +431,119 @@ def delete_session(session_id: str) -> dict:
     if rc != 0:
         return {"success": False, "error": stderr or "Delete failed"}
     return {"success": True, "deleted": session_id}
+
+
+# ── output filtering -------------------------------------------------------
+
+_TOOL_LINE_RE = re.compile(
+    r'^\s*(?:'
+    r'[─═\s]{3,}'
+    r'|```[\w]*'
+    r'|```'
+    r'|(?:>?\s*)(?:Read|Write|Shell|Search|Browse|Edit|Delete|Create|List|Move|Copy)\s+(?:file|directory|path|repo|code)\b'
+    r'|(?:>?\s*)(?:File|Directory|Path)\s'
+    r'|Token(?:s)?:?\s*(?:used|usage)?\s*\d'
+    r'|Tokens?:?\s*\d'
+    r'|Cost:?\s*\$?[\d.]'
+    r'|Time:?\s*[\d.]+s'
+    r'|API\s+request'
+    r'|Rate\s+limit'
+    r'|Retrying'
+    r'|Error:\s*\d'
+    r')',
+    re.IGNORECASE,
+)
+
+
+def _heuristic_filter(text: str) -> str:
+    lines = text.split("\n")
+    out: list[str] = []
+    in_code = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code:
+            continue
+        if _TOOL_LINE_RE.match(stripped):
+            continue
+        out.append(line)
+    return "\n".join(out).strip()
+
+
+def _extract_assistant_summary(raw_output: str) -> str | None:
+    session_id = _active.oc_session_id
+    if not session_id:
+        return None
+
+    for _ in range(3):
+        time.sleep(0.5)
+        data = _session_export(session_id)
+        if data:
+            messages = data.get("messages", [])
+            for msg in reversed(messages):
+                role = msg.get("role", "")
+                if role == "assistant":
+                    content = msg.get("content") or msg.get("text") or ""
+                    if content.strip():
+                        return content.strip()
+    return None
+
+
+# ── background prompt processing -------------------------------------------
+
+_prompt_state: dict = {}
+_prompt_lock = threading.Lock()
+
+
+def start_prompt_background(prompt: str) -> str:
+    global _prompt_state
+    prompt_id = uuid.uuid4().hex[:8]
+
+    before = _capture_pane()
+    escaped = _escape_single_quotes(prompt)
+    _tmux(f"send-keys -t {TMUX_SESSION_NAME} '{escaped}' Enter")
+
+    def _update_progress(content: str):
+        with _prompt_lock:
+            _prompt_state["progress"] = content
+
+    def _run():
+        global _prompt_state
+        try:
+            output = _active._wait_for_stable_output(
+                before, on_progress=_update_progress
+            )
+
+            summary = _extract_assistant_summary(output) or output
+            with _prompt_lock:
+                _prompt_state["running"] = False
+                _prompt_state["done"] = True
+                _prompt_state["result"] = summary
+        except Exception as e:
+            with _prompt_lock:
+                _prompt_state["error"] = str(e)
+                _prompt_state["running"] = False
+                _prompt_state["done"] = True
+
+    with _prompt_lock:
+        _prompt_state = {
+            "prompt_id": prompt_id,
+            "running": True,
+            "done": False,
+            "progress": "",
+            "result": None,
+            "error": None,
+        }
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    return prompt_id
+
+
+def get_prompt_status(prompt_id: str) -> dict:
+    with _prompt_lock:
+        if _prompt_state.get("prompt_id") != prompt_id:
+            return {"error": "prompt_id not found"}
+        return dict(_prompt_state)

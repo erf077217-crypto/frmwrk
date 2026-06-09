@@ -1,0 +1,51 @@
+services:
+
+  # ── Backend ──────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    image: ai-platform-backend:latest
+    container_name: ai-platform-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request, json; d=json.loads(urllib.request.urlopen('http://localhost:8000/health').read()); exit(0 if d.get('status') in ('ok','degraded') else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - ai-platform
+
+  # ── Frontend ─────────────────────────────────────────────
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    image: ai-platform-frontend:latest
+    container_name: ai-platform-frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:80/"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - ai-platform
+
+networks:
+  ai-platform:
+    name: ai-platform
+    driver: bridge

@@ -154,7 +154,7 @@ async function stopCurrentSession() {
 async function sendPrompt(prompt) {
   if (!prompt.trim()) return;
 
-  responseViewer.value = "(sending…)";
+  responseViewer.value = "";
   insertBtn.disabled = true;
   sendBtn.disabled = true;
   setStatus("Sending prompt…", "status-info");
@@ -166,15 +166,48 @@ async function sendPrompt(prompt) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ prompt }),
     });
-    const data = await r.json();
+    const { prompt_id, success, error } = await r.json();
 
-    if (data.success) {
-      responseViewer.value = data.output || "(no output)";
-      setStatus("Response ready", "status-ok");
-      insertBtn.disabled = false;
-    } else {
-      setStatus(`Error: ${data.error || "Unknown"}`, "status-err");
-      responseViewer.value = data.output || `Error: ${data.error}`;
+    if (!success) {
+      setStatus(`Error: ${error || "Unknown"}`, "status-err");
+      responseViewer.value = `Error: ${error}`;
+      sendBtn.disabled = false;
+      return;
+    }
+
+    // Poll for progress
+    const pollUrl = `${BRIDGE}/session/prompt-status/${prompt_id}`;
+    let done = false;
+
+    while (!done) {
+      await new Promise((r) => setTimeout(r, 500));
+      const pr = await fetch(pollUrl);
+      const ps = await pr.json();
+
+      if (ps.error) {
+        setStatus(`Error: ${ps.error}`, "status-err");
+        break;
+      }
+
+      if (ps.progress) {
+        responseViewer.value = ps.progress;
+      }
+
+      if (ps.done) {
+        done = true;
+        if (ps.error) {
+          setStatus(`Error: ${ps.error}`, "status-err");
+          responseViewer.value = `Error: ${ps.error}`;
+        } else {
+          const finalText = ps.result || ps.progress || "(no output)";
+          responseViewer.value = finalText;
+          setStatus("Response ready", "status-ok");
+          insertBtn.disabled = false;
+        }
+      } else {
+        const dots = ".".repeat((Math.floor(Date.now() / 1000) % 3) + 1);
+        setStatus(`Running${dots}`, "status-info");
+      }
     }
   } catch (err) {
     setStatus(`Error: ${err.message}`, "status-err");

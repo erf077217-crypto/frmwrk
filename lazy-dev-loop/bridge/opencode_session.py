@@ -7,6 +7,8 @@ from tmux_session import (  # noqa: F401
     start_session,
     stop_session,
     send_prompt,
+    start_prompt_background,
+    get_prompt_status,
     open_terminal,
     list_sessions,
     get_session,
