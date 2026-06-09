@@ -89,5 +89,18 @@ class ToolInfo(BaseModel):
     parameters: dict
 
 
+# ── Tool Execution ─────────────────────────────────────────
+
+class ToolExecuteRequest(BaseModel):
+    args: dict = Field(default_factory=dict, description="Keyword arguments passed to the tool's execute method.")
+
+
+class ToolExecuteResponse(BaseModel):
+    name: str
+    success: bool
+    output: object | None = None
+    error: str | None = None
+
+
 class ToolListResponse(BaseModel):
     tools: list[ToolInfo]

@@ -159,8 +159,9 @@ def build_default_registries(settings: Any) -> None:
     # ── Tools ───────────────────────────────────────────────
     from tools.builtin import DatabaseTool, DirectoryTool, FileTool, GitTool, ShellTool
 
-    tool_registry.register(FileTool())
-    tool_registry.register(DirectoryTool())
-    tool_registry.register(GitTool())
-    tool_registry.register(ShellTool())
-    tool_registry.register(DatabaseTool())
+    tool_config = {"workspace": settings.workspace_dir, "db_path": settings.db_path}
+    tool_registry.register(FileTool(tool_config))
+    tool_registry.register(DirectoryTool(tool_config))
+    tool_registry.register(GitTool(tool_config))
+    tool_registry.register(ShellTool(tool_config))
+    tool_registry.register(DatabaseTool(tool_config))

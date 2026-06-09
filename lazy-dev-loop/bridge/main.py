@@ -100,12 +100,13 @@ async def session_stop():
 
 class SessionPromptRequest(BaseModel):
     prompt: str
+    mode: str = "summary"
 
 
 @app.post("/session/prompt")
 async def session_prompt(req: SessionPromptRequest):
-    prompt_id = ocs.start_prompt_background(req.prompt)
-    return {"prompt_id": prompt_id, "success": True}
+    prompt_id = ocs.start_prompt_background(req.prompt, mode=req.mode)
+    return {"prompt_id": prompt_id, "success": True, "mode": req.mode}
 
 
 @app.get("/session/prompt-status/{prompt_id}")

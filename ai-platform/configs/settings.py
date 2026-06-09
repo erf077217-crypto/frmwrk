@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     enable_gemini: bool = True
     enable_ollama: bool = True
 
+    # ── Workspace ───────────────────────────────────────────
+    workspace_dir: str = "/tmp/workspace"
+    db_path: str = "/tmp/workspace/data.db"
+
     # ── Server ──────────────────────────────────────────────
     host: str = "0.0.0.0"
     port: int = 8000

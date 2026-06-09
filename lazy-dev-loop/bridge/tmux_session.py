@@ -125,19 +125,44 @@ def _session_list() -> list[dict]:
     return sessions
 
 
+def _normalize_messages(raw_messages: list) -> list[dict]:
+    normalized = []
+    for msg in raw_messages:
+        role = msg.get("info", {}).get("role", msg.get("role", "user"))
+        parts = msg.get("parts", [])
+        content_parts = []
+        for part in parts:
+            if part.get("type") == "text":
+                t = part.get("text", "")
+                if t:
+                    content_parts.append(t)
+        content = "\n".join(content_parts) if content_parts else (msg.get("content") or msg.get("text") or "")
+        normalized.append({"role": role, "content": content})
+    return normalized
+
+
+def _dbg(msg: str):
+    if config.DEBUG_OUTPUT:
+        print(f"[DEBUG tmux_session] {msg}", flush=True)
+
+
 def _session_export(session_id: str) -> dict | None:
     stdout, _, rc = _opencode_cli("export", session_id)
     if rc != 0 or not stdout:
+        _dbg(f"_session_export({session_id}): rc={rc} stdout_empty={not stdout}")
         return None
     lines = stdout.split("\n")
     if lines and lines[0].startswith("Exporting session"):
         stdout = "\n".join(lines[1:])
     try:
         data = json.loads(stdout)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        _dbg(f"_session_export({session_id}): JSON decode error: {e}")
         return None
     info = data.get("info", {})
-    messages = data.get("messages", [])
+    raw_messages = data.get("messages", [])
+    norm = _normalize_messages(raw_messages)
+    _dbg(f"_session_export({session_id}): {len(norm)} messages, roles={[m['role'] for m in norm]}")
     return {
         "session_id": info.get("id"),
         "title": info.get("title"),
@@ -148,7 +173,7 @@ def _session_export(session_id: str) -> dict | None:
         "tokens": info.get("tokens"),
         "cost": info.get("cost"),
         "time": info.get("time"),
-        "messages": messages,
+        "messages": norm,
         "source": "opencode",
     }
 
@@ -257,7 +282,7 @@ class TmuxSession:
 
     # ── prompt -----------------------------------------------------------
 
-    def send_prompt(self, prompt: str) -> dict:
+    def send_prompt(self, prompt: str, mode: str = "summary") -> dict:
         if not self.active:
             return {
                 "success": False,
@@ -269,15 +294,21 @@ class TmuxSession:
         escaped = _escape_single_quotes(prompt)
         _tmux(f"send-keys -t {TMUX_SESSION_NAME} '{escaped}' Enter")
 
-        output = self._wait_for_stable_output(before)
+        raw_output = self._wait_for_stable_output(before)
 
         self.prompt_count += 1
         self._last_capture = _capture_pane()
 
-        return {
-            "success": True,
-            "output": output.strip(),
-        }
+        if mode == "summary":
+            clean = _extract_assistant_response()
+            if clean:
+                return {"success": True, "output": clean, "source": "export"}
+            final_pane = _capture_pane()
+            filtered = _heuristic_filter(strip_ansi(final_pane))
+            if filtered:
+                return {"success": True, "output": filtered, "source": "filtered"}
+
+        return {"success": True, "output": raw_output.strip(), "source": "raw"}
 
     def _wait_for_stable_output(
         self,
@@ -400,8 +431,8 @@ async def stop_session() -> dict:
     return _active.stop()
 
 
-async def send_prompt(prompt: str) -> dict:
-    return _active.send_prompt(prompt)
+async def send_prompt(prompt: str, mode: str = "summary") -> dict:
+    return _active.send_prompt(prompt, mode=mode)
 
 
 def get_session_status() -> dict:
@@ -435,23 +466,13 @@ def delete_session(session_id: str) -> dict:
 
 # ── output filtering -------------------------------------------------------
 
-_TOOL_LINE_RE = re.compile(
-    r'^\s*(?:'
-    r'[─═\s]{3,}'
-    r'|```[\w]*'
-    r'|```'
-    r'|(?:>?\s*)(?:Read|Write|Shell|Search|Browse|Edit|Delete|Create|List|Move|Copy)\s+(?:file|directory|path|repo|code)\b'
-    r'|(?:>?\s*)(?:File|Directory|Path)\s'
-    r'|Token(?:s)?:?\s*(?:used|usage)?\s*\d'
-    r'|Tokens?:?\s*\d'
-    r'|Cost:?\s*\$?[\d.]'
-    r'|Time:?\s*[\d.]+s'
-    r'|API\s+request'
-    r'|Rate\s+limit'
-    r'|Retrying'
-    r'|Error:\s*\d'
-    r')',
-    re.IGNORECASE,
+_TUI_CHARS = set(
+    "┌┐└┘├┤┬┴┼╒╕╘╛╞╡╪╓╖╙╜╟╢╫"
+    "─═│║╔╗╚╝╠╣╦╩╬▀▄█▌▐░▒▓■●◦◌◆◇▶▷▸►▻"
+)
+
+_BORDER_ONLY_RE = re.compile(
+    r'^[─═┌┐└┘├┤┬┴┼╒╕╘╛╞╡╪╓╖╙╜╟╢╫╔╗╚╝╠╣╦╩╬▀▄█▌▐░▒▓■●\s]+$',
 )
 
 
@@ -459,73 +480,187 @@ def _heuristic_filter(text: str) -> str:
     lines = text.split("\n")
     out: list[str] = []
     in_code = False
+    dropped_lines = 0
     for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("```"):
+        raw = line.strip()
+        if not raw:
+            continue
+
+        if raw.startswith("```"):
             in_code = not in_code
             continue
         if in_code:
             continue
-        if _TOOL_LINE_RE.match(stripped):
+
+        if _BORDER_ONLY_RE.match(raw):
+            dropped_lines += 1
             continue
-        out.append(line)
-    return "\n".join(out).strip()
+
+        content = raw.strip("".join(_TUI_CHARS) + " \t>")
+
+        if not content:
+            dropped_lines += 1
+            continue
+
+        if re.match(r'^opencode\s+v?\d+', content, re.I):
+            dropped_lines += 1
+            continue
+        if re.match(r'^opencode\s+\d+\.\d+', content, re.I):
+            dropped_lines += 1
+            continue
+
+        if re.match(r'^[d\-lpsbc]\S{9}\s+\d+', content):
+            dropped_lines += 1
+            continue
+        if re.match(r'^total\s+\d+', content, re.I):
+            dropped_lines += 1
+            continue
+
+        first_word = content.split(None, 1)[0].lower().rstrip(":;")
+
+        if first_word in ("read", "write", "shell", "search", "browse",
+                          "edit", "delete", "create", "list", "move", "copy"):
+            if len(content) < 60:
+                dropped_lines += 1
+                continue
+        if first_word in ("file", "directory", "path"):
+            if len(content) < 60:
+                dropped_lines += 1
+                continue
+        if re.match(r'^v?\d+\.\d+', first_word):
+            dropped_lines += 1
+            continue
+        if re.match(r'^\$?[\d.,]+', first_word) and re.match(r'^[\d.,]+$', first_word):
+            dropped_lines += 1
+            continue
+
+        if content.startswith("Press ") or content.startswith("Type "):
+            dropped_lines += 1
+            continue
+
+        out.append(content)
+
+    result = "\n".join(out).strip()
+    _dbg(f"_heuristic_filter: in_lines={len(lines)} dropped={dropped_lines} out_lines={len(out)} out_chars={len(result)}")
+    return result
 
 
-def _extract_assistant_summary(raw_output: str) -> str | None:
-    session_id = _active.oc_session_id
-    if not session_id:
+def _extract_assistant_response(session_id: str | None = None, max_attempts: int = 30) -> str | None:
+    sid = session_id or _active.oc_session_id
+    if not sid:
+        _dbg("_extract_assistant_response: no session_id")
         return None
 
-    for _ in range(3):
+    _dbg(f"_extract_assistant_response: session={sid} max_attempts={max_attempts}")
+    for i in range(max_attempts):
         time.sleep(0.5)
-        data = _session_export(session_id)
-        if data:
-            messages = data.get("messages", [])
-            for msg in reversed(messages):
-                role = msg.get("role", "")
-                if role == "assistant":
-                    content = msg.get("content") or msg.get("text") or ""
-                    if content.strip():
-                        return content.strip()
+        data = _session_export(sid)
+        if not data:
+            _dbg(f"_extract_assistant_response: attempt {i} — no export data yet")
+            continue
+        messages = data.get("messages", [])
+        for msg in reversed(messages):
+            if msg.get("role") == "assistant":
+                content = msg.get("content", "").strip()
+                if content:
+                    _dbg(f"_extract_assistant_response: found at attempt {i} ({len(content)} chars)")
+                    return content
+    _dbg(f"_extract_assistant_response: exhausted {max_attempts} attempts, no assistant content found")
     return None
 
 
-# ── background prompt processing -------------------------------------------
+# ── background prompt processing (via opencode run --format json) -----------
 
 _prompt_state: dict = {}
 _prompt_lock = threading.Lock()
 
 
-def start_prompt_background(prompt: str) -> str:
+def start_prompt_background(prompt: str, mode: str = "summary") -> str:
+    """Run prompt via `opencode run --format json` subprocess.
+
+    Reads structured JSON events from stdout — no tmux, no scraping,
+    no heuristic filters.  The assistant text arrives in a single "text"
+    event once the model finishes generating.
+    """
     global _prompt_state
     prompt_id = uuid.uuid4().hex[:8]
 
-    before = _capture_pane()
-    escaped = _escape_single_quotes(prompt)
-    _tmux(f"send-keys -t {TMUX_SESSION_NAME} '{escaped}' Enter")
-
-    def _update_progress(content: str):
-        with _prompt_lock:
-            _prompt_state["progress"] = content
+    # Build command:  opencode run --format json [--continue] <prompt>
+    cmd = [config.OPENCODE_COMMAND, "run", "--format", "json"]
+    if _active.oc_session_id:
+        cmd.append("--continue")
+    cmd.append(prompt)
 
     def _run():
-        global _prompt_state
+        global _prompt_state, _active
+        proc = None
         try:
-            output = _active._wait_for_stable_output(
-                before, on_progress=_update_progress
+            _dbg(f"starting: {' '.join(cmd)}")
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
             )
 
-            summary = _extract_assistant_summary(output) or output
+            text_parts: list[str] = []
+
+            for raw_line in proc.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                event_type = event.get("type")
+
+                if event_type == "step_start":
+                    sid = event.get("sessionID")
+                    if sid:
+                        _active.oc_session_id = sid
+                        _dbg(f"  session={sid}")
+
+                elif event_type == "text":
+                    part_text = event.get("part", {}).get("text", "")
+                    if part_text:
+                        text_parts.append(part_text)
+                        with _prompt_lock:
+                            _prompt_state["progress"] = "".join(text_parts)
+                            _prompt_state["text_chunks"] = list(text_parts)
+
+                elif event_type == "error":
+                    err = event.get("error", {})
+                    msg = err.get("data", {}).get("message", str(err))
+                    _dbg(f"  error: {msg}")
+                    with _prompt_lock:
+                        _prompt_state["error"] = msg
+
+            _active.prompt_count += 1
+            final_text = "".join(text_parts)
+
+            _dbg(f"_run: result {len(final_text)} chars")
+
             with _prompt_lock:
                 _prompt_state["running"] = False
                 _prompt_state["done"] = True
-                _prompt_state["result"] = summary
+                _prompt_state["result"] = final_text.strip()
+                _prompt_state["text_chunks"] = None
+                _prompt_state.pop("progress", None)
+
         except Exception as e:
+            _dbg(f"_run exception: {e}")
             with _prompt_lock:
                 _prompt_state["error"] = str(e)
                 _prompt_state["running"] = False
                 _prompt_state["done"] = True
+        finally:
+            if proc and proc.returncode is None:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
 
     with _prompt_lock:
         _prompt_state = {
@@ -535,6 +670,7 @@ def start_prompt_background(prompt: str) -> str:
             "progress": "",
             "result": None,
             "error": None,
+            "mode": mode,
         }
 
     thread = threading.Thread(target=_run, daemon=True)

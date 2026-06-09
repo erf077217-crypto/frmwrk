@@ -44,6 +44,10 @@ const workspaceInput     = document.getElementById("workspaceInput");
 const workspaceSetBtn    = document.getElementById("workspaceSetBtn");
 const workspaceCancelBtn = document.getElementById("workspaceCancelBtn");
 
+// Mode toggle
+const modeToggleBtn      = document.getElementById("modeToggleBtn");
+let currentMode          = "summary"; // "summary" | "raw"
+
 // Diagnostics
 const pingBtn            = document.getElementById("pingBtn");
 const tabInfoBtn         = document.getElementById("tabInfoBtn");
@@ -151,6 +155,15 @@ async function stopCurrentSession() {
 
 // ── Prompt / Response ────────────────────────────────────────────────────
 
+function toggleMode() {
+  currentMode = currentMode === "summary" ? "raw" : "summary";
+  modeToggleBtn.textContent = currentMode === "summary" ? "Summary" : "Raw";
+  modeToggleBtn.className = currentMode === "summary" ? "secondary" : "accent";
+  setStatus(`Mode: ${currentMode}`, "status-info");
+}
+
+modeToggleBtn.addEventListener("click", toggleMode);
+
 async function sendPrompt(prompt) {
   if (!prompt.trim()) return;
 
@@ -158,13 +171,13 @@ async function sendPrompt(prompt) {
   insertBtn.disabled = true;
   sendBtn.disabled = true;
   setStatus("Sending prompt…", "status-info");
-  debug(`Sending: ${prompt.substring(0, 60)}`);
+  debug(`Sending: ${prompt.substring(0, 60)} (mode=${currentMode})`);
 
   try {
     const r = await fetch(`${BRIDGE}/session/prompt`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt }),
+      body: JSON.stringify({ prompt, mode: currentMode }),
     });
     const { prompt_id, success, error } = await r.json();
 
@@ -199,14 +212,22 @@ async function sendPrompt(prompt) {
           setStatus(`Error: ${ps.error}`, "status-err");
           responseViewer.value = `Error: ${ps.error}`;
         } else {
-          const finalText = ps.result || ps.progress || "(no output)";
-          responseViewer.value = finalText;
-          setStatus("Response ready", "status-ok");
-          insertBtn.disabled = false;
+          const finalText = ps.result || ps.progress || "";
+          responseViewer.value = finalText || "(no output)";
+          if (finalText) {
+            setStatus("Response ready", "status-ok");
+            insertBtn.disabled = false;
+          } else {
+            setStatus("Empty response", "status-err");
+          }
         }
       } else {
-        const dots = ".".repeat((Math.floor(Date.now() / 1000) % 3) + 1);
-        setStatus(`Running${dots}`, "status-info");
+        if (currentMode === "summary") {
+          const dots = ".".repeat((Math.floor(Date.now() / 1000) % 3) + 1);
+          setStatus(`Running${dots}`, "status-info");
+        } else {
+          setStatus("Running (raw)", "status-err");
+        }
       }
     }
   } catch (err) {
