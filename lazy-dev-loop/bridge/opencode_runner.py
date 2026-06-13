@@ -59,6 +59,7 @@ def check_wsl() -> bool:
         subprocess.run(
             ["wsl.exe", "--status"],
             capture_output=True,
+            encoding='utf-8',
             timeout=10,
         )
         return True

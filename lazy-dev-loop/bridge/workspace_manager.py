@@ -53,14 +53,14 @@ def set_workspace(win_path: str) -> dict:
         return {"success": False, "error": str(e)}
 
     data = {"workspace": win_path, "wsl_path": wsl_path}
-    WORKSPACE_FILE.write_text(json.dumps(data, indent=2))
+    WORKSPACE_FILE.write_text(json.dumps(data, indent=2), encoding='utf-8')
     return {"success": True, "workspace": win_path, "wsl_path": wsl_path}
 
 
 def get_workspace() -> dict:
     if WORKSPACE_FILE.exists():
         try:
-            data = json.loads(WORKSPACE_FILE.read_text())
+            data = json.loads(WORKSPACE_FILE.read_text(encoding='utf-8'))
             return data
         except (json.JSONDecodeError, KeyError):
             pass

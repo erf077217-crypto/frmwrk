@@ -214,6 +214,18 @@ async function sendPrompt(prompt) {
         } else {
           const finalText = ps.result || ps.progress || "";
           responseViewer.value = finalText || "(no output)";
+          // Diagnostic: compare API response vs editor content
+          debug(`DIAG: api.response.length=${finalText.length}`);
+          debug(`DIAG: api.response.first200=${JSON.stringify(finalText.substring(0, 200))}`);
+          debug(`DIAG: api.response.last200=${JSON.stringify(finalText.substring(Math.max(0, finalText.length - 200)))}`);
+          debug(`DIAG: editor.value.length=${responseViewer.value.length}`);
+          debug(`DIAG: editor.value.first200=${JSON.stringify(responseViewer.value.substring(0, 200))}`);
+          debug(`DIAG: editor.value.last200=${JSON.stringify(responseViewer.value.substring(Math.max(0, responseViewer.value.length - 200)))}`);
+          if (responseViewer.value.length !== finalText.length) {
+            debug(`*** MISMATCH: editor(${responseViewer.value.length}) != api(${finalText.length}) ***`);
+          } else {
+            debug("DIAG: editor.length === api.response.length OK");
+          }
           if (finalText) {
             setStatus("Response ready", "status-ok");
             insertBtn.disabled = false;

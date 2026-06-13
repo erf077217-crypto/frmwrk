@@ -1,8 +1,10 @@
 from collections.abc import Callable
 import json
+import os
 import re
 import shlex
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -586,14 +588,17 @@ def start_prompt_background(prompt: str, mode: str = "summary") -> str:
     prompt_id = uuid.uuid4().hex[:8]
 
     # Build command:  opencode run --format json [--continue] <prompt>
-    cmd = [config.OPENCODE_COMMAND, "run", "--format", "json"]
+    # NOTE: Must use _wsl_cmd() so this works on Windows (where opencode lives in WSL)
+    inner = f"{config.OPENCODE_COMMAND} run --format json"
     if _active.oc_session_id:
-        cmd.append("--continue")
-    cmd.append(prompt)
+        inner += " --continue"
+    inner += f" {shlex.quote(prompt)}"
+    cmd = _wsl_cmd(inner)
 
     def _run():
         global _prompt_state, _active
         proc = None
+        _raw_log = None
         try:
             _dbg(f"starting: {' '.join(cmd)}")
             proc = subprocess.Popen(
@@ -601,11 +606,16 @@ def start_prompt_background(prompt: str, mode: str = "summary") -> str:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 text=True,
+                encoding='utf-8',
             )
 
             text_parts: list[str] = []
+            _raw_log_path = os.path.join(tempfile.gettempdir(), "opencode_raw_lines.log")
+            _raw_log = open(_raw_log_path, "w", encoding='utf-8')
+            _raw_log.write(f"START cmd={' '.join(cmd)}\n")
 
             for raw_line in proc.stdout:
+                _raw_log.write(raw_line)
                 line = raw_line.strip()
                 if not line:
                     continue
@@ -615,20 +625,41 @@ def start_prompt_background(prompt: str, mode: str = "summary") -> str:
                     continue
 
                 event_type = event.get("type")
+                part_type = event.get("part", {}).get("type", "")
+                part_keys = list(event.get("part", {}).keys()) if event.get("part") else []
+
+                # Log every event type and its string content (for TUI leak diagnosis)
+                all_texts = {}
+                def _gather_strings(obj, path=""):
+                    if isinstance(obj, str) and len(obj) > 5:
+                        all_texts[path] = obj[:120]
+                    elif isinstance(obj, dict):
+                        for k, v in obj.items():
+                            _gather_strings(v, f"{path}.{k}")
+                    elif isinstance(obj, list):
+                        for i, v in enumerate(obj):
+                            _gather_strings(v, f"{path}[{i}]")
+                _gather_strings(event)
+                if event_type not in ("step_start", "step_finish") or any("▣" in v or "Build" in v or "OpenCode Zen" in v or "┃" in v for v in all_texts.values()):
+                    for k, v in all_texts.items():
+                        if len(v) >= 10 and not k.startswith(".part.tokens") and not k.startswith(".part.id"):
+                            _dbg(f"  {event_type!r} {k}={v!r}")
 
                 if event_type == "step_start":
                     sid = event.get("sessionID")
                     if sid:
                         _active.oc_session_id = sid
-                        _dbg(f"  session={sid}")
 
                 elif event_type == "text":
                     part_text = event.get("part", {}).get("text", "")
-                    if part_text:
+                    _dbg(f"  text event: part.type={part_type!r} text_len={len(part_text)} part_type==text={part_type == 'text'}")
+                    if part_type == "text" and part_text:
                         text_parts.append(part_text)
                         with _prompt_lock:
                             _prompt_state["progress"] = "".join(text_parts)
                             _prompt_state["text_chunks"] = list(text_parts)
+                    elif part_text:
+                        _dbg(f"  *** REJECTED text event (part.type={part_type!r} != 'text') text={part_text[:120]!r}")
 
                 elif event_type == "error":
                     err = event.get("error", {})
@@ -637,6 +668,10 @@ def start_prompt_background(prompt: str, mode: str = "summary") -> str:
                     with _prompt_lock:
                         _prompt_state["error"] = msg
 
+                else:
+                    _dbg(f"  UNHANDLED event type={event_type!r} keys={list(event.keys())} part_keys={part_keys}")
+
+            _raw_log.close()
             _active.prompt_count += 1
             final_text = "".join(text_parts)
 
@@ -651,6 +686,12 @@ def start_prompt_background(prompt: str, mode: str = "summary") -> str:
 
         except Exception as e:
             _dbg(f"_run exception: {e}")
+            if _raw_log:
+                try:
+                    _raw_log.write(f"EXCEPTION: {e}\n")
+                    _raw_log.close()
+                except Exception:
+                    pass
             with _prompt_lock:
                 _prompt_state["error"] = str(e)
                 _prompt_state["running"] = False

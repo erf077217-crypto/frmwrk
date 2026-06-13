@@ -35,6 +35,7 @@ def tmux(cmd: str) -> tuple[str, str, int]:
         full,
         capture_output=True,
         text=True,
+        encoding='utf-8',
         timeout=10,
         shell=True,
     )
@@ -49,13 +50,13 @@ def test_lifecycle():
     print("=== Tmux + OpenCode Integration Test ===\n")
 
     # 0. Pre-flight
-    r = subprocess.run(["which", "tmux"], capture_output=True, text=True)
+    r = subprocess.run(["which", "tmux"], capture_output=True, text=True, encoding='utf-8')
     assert r.returncode == 0, "tmux not found"
-    print(f"[OK] tmux: {subprocess.run(['tmux', '-V'], capture_output=True, text=True).stdout.strip()}")
+    print(f"[OK] tmux: {subprocess.run(['tmux', '-V'], capture_output=True, text=True, encoding='utf-8').stdout.strip()}")
 
-    r = subprocess.run(["which", "opencode"], capture_output=True, text=True)
+    r = subprocess.run(["which", "opencode"], capture_output=True, text=True, encoding='utf-8')
     assert r.returncode == 0, "opencode not found"
-    print(f"[OK] opencode: {subprocess.run(['opencode', '--version'], capture_output=True, text=True).stdout.strip()}")
+    print(f"[OK] opencode: {subprocess.run(['opencode', '--version'], capture_output=True, text=True, encoding='utf-8').stdout.strip()}")
 
     cleanup()
     time.sleep(0.5)
