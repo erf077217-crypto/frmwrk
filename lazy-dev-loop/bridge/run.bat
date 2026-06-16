@@ -37,5 +37,10 @@ echo   Uvicorn: %UVICORN_CMD%
 echo ============================================
 echo.
 
+REM Release port if already in use
+for /f "tokens=5" %%p in ('netstat -ano ^| findstr ":7777 "') do (
+  taskkill /F /PID %%p >nul 2>nul
+)
+
 "%UVICORN_CMD%" %APP_MODULE% --host %HOST% --port %PORT%
 pause

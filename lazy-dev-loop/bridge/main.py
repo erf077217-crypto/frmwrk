@@ -24,7 +24,6 @@ app.add_middleware(
 
 class HealthResponse(BaseModel):
     status: str
-    wsl_available: bool
     opencode_available: bool
     tmux_available: bool
 
@@ -33,7 +32,6 @@ class HealthResponse(BaseModel):
 async def health():
     return HealthResponse(
         status="ok",
-        wsl_available=opencode_runner.check_wsl(),
         opencode_available=opencode_runner.check_opencode(),
         tmux_available=ocs.check_tmux(),
     )
@@ -170,11 +168,10 @@ async def open_terminal():
 
 @app.get("/debug/session")
 async def debug_session():
-    from tmux_session import _active, TMUX_SESSION_NAME, _session_export
+    from tmux_session import _active, _current_session_id, TMUX_SESSION_NAME, _session_export
 
-    oc_id = _active.oc_session_id
+    oc_id = _current_session_id
     tmux_alive = _active.active
-    bridge_finished = _active.finished
 
     opencode_data = None
     if oc_id:
@@ -191,13 +188,7 @@ async def debug_session():
         },
         "bridge": {
             "session_id": oc_id,
-            "active_flag": tmux_alive,
-            "finished_flag": bridge_finished,
-            "started_at": _active.started_at,
-            "prompt_count": _active.prompt_count,
-        },
-        "ui": {
-            "shows_active": tmux_alive and not bridge_finished,
+            "active": tmux_alive,
         },
         "workspace": wm.get_workspace(),
     }

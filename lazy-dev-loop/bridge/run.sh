@@ -51,4 +51,9 @@ echo "  Uvicorn: $UVICORN_CMD"
 echo "============================================"
 echo ""
 
+# Release port if already in use
+if command -v fuser &>/dev/null; then
+  fuser -k "${PORT}/tcp" 2>/dev/null || true
+fi
+
 exec "$UVICORN_CMD" "$APP_MODULE" --host "$HOST" --port "$PORT"

@@ -36,14 +36,14 @@ Session IDs follow the format `ses_[a-zA-Z0-9]+` and are created/managed entirel
 - `POST /sessions/archive/{id}` endpoint
 - `archiveSession()` JS function
 - Bridge-generated UUID session IDs (`uuid.uuid4().hex[:12]`)
-- `ss.append_message()` / `ss.finalize_session()` in `send_prompt()` / `stop()`
+- `ss.append_message()` / `ss.finalize_session()` in removed `send_prompt()` / `stop()`
 - `session_store` import from `tmux_session.py`
 
 ### Changed
 - `bridge/tmux_session.py`:
   - `start()` accepts optional `session_id` for `opencode --session`
   - Removed session_store dependency
-  - `send_prompt()` no longer persists to bridge store
+  - `send_prompt()` removed (replaced by `start_prompt_background` with `--session <id>`)
   - `stop()` no longer calls finalize
   - Added `list_sessions()` → delegates to `opencode session list`
   - Added `get_session(id)` → delegates to `opencode export <id>`

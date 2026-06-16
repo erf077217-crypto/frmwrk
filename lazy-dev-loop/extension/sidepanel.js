@@ -1,67 +1,55 @@
 const BRIDGE = "http://localhost:7777";
 
-// ── Page navigation ──────────────────────────────────────────────────────
+// ── DOM refs ──────────────────────────────────────────────────────────────
 
-const pageMgmt   = document.getElementById("page-mgmt");
-const pageActive = document.getElementById("page-active");
-const backBtn    = document.getElementById("backToMgmtBtn");
-
-function showPage(page) {
-  pageMgmt.classList.toggle("hidden", page !== "mgmt");
-  pageActive.classList.toggle("hidden", page !== "active");
-}
-
-backBtn.addEventListener("click", () => showPage("mgmt"));
-
-// ── DOM refs ─────────────────────────────────────────────────────────────
-
-const statusEl           = document.getElementById("status");
+const statusBar          = document.getElementById("statusBar");
 const debugLog           = document.getElementById("debugLog");
 
-// Page 1 — management
-const newSessionBtn      = document.getElementById("newSessionBtn");
-const savedSessionList   = document.getElementById("savedSessionList");
-const mgmtWorkspacePath  = document.getElementById("mgmtWorkspacePath");
-const mgmtSessionState   = document.getElementById("mgmtSessionState");
-const mgmtSessionId      = document.getElementById("mgmtSessionId");
-const mgmtSessionUptime  = document.getElementById("mgmtSessionUptime");
-const mgmtSessionSource  = document.getElementById("mgmtSessionSource");
-const mgmtOpenTerminalBtn= document.getElementById("mgmtOpenTerminalBtn");
-
-// Page 2 — active session
-const promptInput        = document.getElementById("promptInput");
-const sendBtn            = document.getElementById("sendBtn");
-const responseViewer     = document.getElementById("responseViewer");
-const insertBtn          = document.getElementById("insertBtn");
-const activeSessionInfo  = document.getElementById("activeSessionInfo");
-const activeOpenTerminalBtn = document.getElementById("activeOpenTerminalBtn");
-const activeStopBtn      = document.getElementById("activeStopBtn");
-
-// Workspace (shared, lives on page 1 but accessible everywhere)
+// Workspace
+const workspacePath      = document.getElementById("workspacePath");
 const workspaceChangeBtn = document.getElementById("workspaceChangeBtn");
 const workspaceEditRow   = document.getElementById("workspaceEditRow");
 const workspaceInput     = document.getElementById("workspaceInput");
 const workspaceSetBtn    = document.getElementById("workspaceSetBtn");
 const workspaceCancelBtn = document.getElementById("workspaceCancelBtn");
 
-// Mode toggle
+// Session controls
+const newSessionBtn      = document.getElementById("newSessionBtn");
+const stopSessionBtn     = document.getElementById("stopSessionBtn");
+const sessionStateBadge  = document.getElementById("sessionStateBadge");
+const sessionIdDisplay   = document.getElementById("sessionIdDisplay");
+const sessionUptimeDisplay = document.getElementById("sessionUptimeDisplay");
+
+// Saved sessions
+const savedSessionList   = document.getElementById("savedSessionList");
+
+// Prompt
+const promptInput        = document.getElementById("promptInput");
+const sendBtn            = document.getElementById("sendBtn");
 const modeToggleBtn      = document.getElementById("modeToggleBtn");
-let currentMode          = "summary"; // "summary" | "raw"
+let currentMode          = "summary";
+
+// Response
+const responseViewer     = document.getElementById("responseViewer");
+const insertBtn          = document.getElementById("insertBtn");
+
+// Terminal
+const openTerminalBtn    = document.getElementById("openTerminalBtn");
 
 // Diagnostics
 const pingBtn            = document.getElementById("pingBtn");
 const tabInfoBtn         = document.getElementById("tabInfoBtn");
 const refreshBtn         = document.getElementById("refreshBtn");
 
-// ── State ────────────────────────────────────────────────────────────────
+// ── State ─────────────────────────────────────────────────────────────────
 
 let statusPollInterval = null;
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 function setStatus(msg, cls) {
-  statusEl.textContent = msg;
-  statusEl.className = cls || "status-info";
+  statusBar.textContent = msg;
+  statusBar.className = cls || "status-info";
 }
 
 function debug(msg) {
@@ -70,48 +58,52 @@ function debug(msg) {
   debugLog.scrollTop = debugLog.scrollHeight;
 }
 
-// ── Session status (shared) ──────────────────────────────────────────────
+// ── Render ────────────────────────────────────────────────────────────────
+
+function render(data) {
+  if (!data) return;
+  const active = data.active;
+  const sid = data.session_id || "—";
+  const uptime = data.uptime;
+
+  sessionStateBadge.textContent = active ? "Active" : "Inactive";
+  sessionStateBadge.className = `badge badge-${active ? "active" : "inactive"}`;
+
+  sessionIdDisplay.textContent = sid;
+
+  if (active && uptime != null) {
+    const secs = Math.floor(uptime);
+    sessionUptimeDisplay.textContent = `${Math.floor(secs / 60)}m ${secs % 60}s`;
+  } else {
+    sessionUptimeDisplay.textContent = "";
+  }
+
+  stopSessionBtn.disabled = !active;
+  promptInput.disabled = !active;
+  sendBtn.disabled = !active;
+  openTerminalBtn.disabled = !active;
+
+  if (!active) {
+    responseViewer.disabled = true;
+    responseViewer.placeholder = "(start a session to send prompts)";
+    insertBtn.disabled = true;
+  } else {
+    responseViewer.disabled = false;
+  }
+}
+
+// ── Session status ────────────────────────────────────────────────────────
 
 async function fetchSessionStatus() {
   try {
     const r = await fetch(`${BRIDGE}/session/status`);
     const data = await r.json();
-    applySessionStatus(data);
+    render(data);
     return data;
   } catch (err) {
     debug(`fetchSessionStatus: ${err.message}`);
     return null;
   }
-}
-
-function applySessionStatus(data) {
-  if (!data) return;
-  const active = data.active;
-
-  // Page 1 indicators
-  mgmtSessionState.textContent = active ? "Active" : "Inactive";
-  mgmtSessionState.className = `badge badge-${active ? "active" : "inactive"}`;
-  mgmtSessionId.textContent = data.session_id || "—";
-  mgmtOpenTerminalBtn.disabled = !active;
-  mgmtSessionSource.textContent = data.source || "bridge";
-
-  if (data.uptime != null) {
-    const secs = Math.floor(data.uptime);
-    mgmtSessionUptime.textContent = `${Math.floor(secs / 60)}m ${secs % 60}s`;
-  } else {
-    mgmtSessionUptime.textContent = "—";
-  }
-
-  if (data.workspace && data.workspace.workspace) {
-    mgmtWorkspacePath.textContent = data.workspace.workspace;
-  }
-
-  // Page 2 indicator
-  activeSessionInfo.textContent = active
-    ? `Active (${data.session_id || ""})`
-    : "Inactive";
-  activeOpenTerminalBtn.disabled = !active;
-  activeStopBtn.disabled = !active;
 }
 
 // ── Session lifecycle ────────────────────────────────────────────────────
@@ -127,7 +119,6 @@ async function startNewSession() {
       setStatus("Session started", "status-ok");
       debug(`Session started: ${data.session_id}`);
       await fetchSessionStatus();
-      showPage("active");
     } else {
       setStatus(`Error: ${data.error}`, "status-err");
       debug(`Failed: ${data.error}`);
@@ -145,8 +136,9 @@ async function stopCurrentSession() {
   try {
     await fetch(`${BRIDGE}/session/stop`, { method: "POST" });
     setStatus("Session stopped", "status-ok");
+    responseViewer.value = "";
+    insertBtn.disabled = true;
     await fetchSessionStatus();
-    showPage("mgmt");
     await fetchSavedSessions();
   } catch (err) {
     setStatus(`Error: ${err.message}`, "status-err");
@@ -159,7 +151,6 @@ function toggleMode() {
   currentMode = currentMode === "summary" ? "raw" : "summary";
   modeToggleBtn.textContent = currentMode === "summary" ? "Summary" : "Raw";
   modeToggleBtn.className = currentMode === "summary" ? "secondary" : "accent";
-  setStatus(`Mode: ${currentMode}`, "status-info");
 }
 
 modeToggleBtn.addEventListener("click", toggleMode);
@@ -188,7 +179,6 @@ async function sendPrompt(prompt) {
       return;
     }
 
-    // Poll for progress
     const pollUrl = `${BRIDGE}/session/prompt-status/${prompt_id}`;
     let done = false;
 
@@ -214,18 +204,7 @@ async function sendPrompt(prompt) {
         } else {
           const finalText = ps.result || ps.progress || "";
           responseViewer.value = finalText || "(no output)";
-          // Diagnostic: compare API response vs editor content
-          debug(`DIAG: api.response.length=${finalText.length}`);
-          debug(`DIAG: api.response.first200=${JSON.stringify(finalText.substring(0, 200))}`);
-          debug(`DIAG: api.response.last200=${JSON.stringify(finalText.substring(Math.max(0, finalText.length - 200)))}`);
-          debug(`DIAG: editor.value.length=${responseViewer.value.length}`);
-          debug(`DIAG: editor.value.first200=${JSON.stringify(responseViewer.value.substring(0, 200))}`);
-          debug(`DIAG: editor.value.last200=${JSON.stringify(responseViewer.value.substring(Math.max(0, responseViewer.value.length - 200)))}`);
-          if (responseViewer.value.length !== finalText.length) {
-            debug(`*** MISMATCH: editor(${responseViewer.value.length}) != api(${finalText.length}) ***`);
-          } else {
-            debug("DIAG: editor.length === api.response.length OK");
-          }
+          debug(`Response: ${finalText.length} chars`);
           if (finalText) {
             setStatus("Response ready", "status-ok");
             insertBtn.disabled = false;
@@ -283,7 +262,7 @@ insertBtn.addEventListener("click", async () => {
   }
 });
 
-// ── Session history ──────────────────────────────────────────────────────
+// ── Saved sessions ───────────────────────────────────────────────────────
 
 async function fetchSavedSessions() {
   try {
@@ -298,7 +277,7 @@ async function fetchSavedSessions() {
 function renderSavedSessions(sessions) {
   if (!sessions.length) {
     savedSessionList.innerHTML =
-      '<div style="color:#585b70;text-align:center;padding:12px;font-size:11px;">No saved sessions</div>';
+      '<div style="color:#585b70;text-align:center;padding:10px;font-size:11px;">No saved sessions</div>';
     return;
   }
   savedSessionList.innerHTML = sessions
@@ -309,12 +288,11 @@ function renderSavedSessions(sessions) {
       return `<div class="session-list-item">
         <div>
           <div class="sli-id" title="${s.session_id}">${title}</div>
-          <div class="sli-meta">${s.session_id}</div>
-          <div class="sli-meta">${updated} · from OpenCode</div>
+          <div class="sli-meta">${s.session_id} · ${updated}</div>
         </div>
         <div class="sli-actions">
-          <button class="secondary" data-load="${s.session_id}">Load</button>
-          <button class="secondary" data-delete="${s.session_id}">Delete</button>
+          <button data-load="${s.session_id}">Load</button>
+          <button data-delete="${s.session_id}">Delete</button>
         </div>
       </div>`;
     })
@@ -336,8 +314,9 @@ async function loadSession(sessionId) {
     const data = await r.json();
     if (data.success) {
       setStatus("Session loaded", "status-ok");
+      responseViewer.value = "";
+      insertBtn.disabled = true;
       await fetchSessionStatus();
-      showPage("active");
       await fetchSavedSessions();
     } else {
       setStatus(`Error: ${data.error}`, "status-err");
@@ -370,7 +349,7 @@ async function fetchWorkspace() {
   try {
     const r = await fetch(`${BRIDGE}/workspace`);
     const data = await r.json();
-    mgmtWorkspacePath.textContent = data.workspace || "(not set)";
+    workspacePath.textContent = data.workspace || "(not set)";
   } catch (err) {
     debug(`fetchWorkspace: ${err.message}`);
   }
@@ -387,7 +366,7 @@ async function setWorkspace(path) {
     const data = await r.json();
     if (data.success) {
       setStatus(`Workspace: ${data.workspace}`, "status-ok");
-      mgmtWorkspacePath.textContent = data.workspace;
+      workspacePath.textContent = data.workspace;
       workspaceEditRow.classList.add("hidden");
       workspaceChangeBtn.classList.remove("hidden");
     } else {
@@ -401,7 +380,7 @@ async function setWorkspace(path) {
 workspaceChangeBtn.addEventListener("click", () => {
   workspaceEditRow.classList.remove("hidden");
   workspaceChangeBtn.classList.add("hidden");
-  workspaceInput.value = mgmtWorkspacePath.textContent !== "(not set)" ? mgmtWorkspacePath.textContent : "";
+  workspaceInput.value = workspacePath.textContent !== "(not set)" ? workspacePath.textContent : "";
   workspaceInput.focus();
 });
 workspaceSetBtn.addEventListener("click", () => setWorkspace(workspaceInput.value.trim()));
@@ -430,13 +409,12 @@ async function openTerminal() {
   }
 }
 
-mgmtOpenTerminalBtn.addEventListener("click", openTerminal);
-activeOpenTerminalBtn.addEventListener("click", openTerminal);
+openTerminalBtn.addEventListener("click", openTerminal);
 
 // ── Button wiring ────────────────────────────────────────────────────────
 
 newSessionBtn.addEventListener("click", startNewSession);
-activeStopBtn.addEventListener("click", async () => {
+stopSessionBtn.addEventListener("click", async () => {
   await stopCurrentSession();
   await fetchSavedSessions();
 });
@@ -480,7 +458,6 @@ chrome.storage.session.onChanged.addListener((changes) => {
     if (prompt) {
       debug(`Context menu prompt: ${prompt.substring(0, 60)}`);
       promptInput.value = prompt;
-      showPage("active");
       sendPrompt(prompt);
     }
   }
@@ -493,7 +470,6 @@ chrome.storage.session.get(["pendingPrompt", "panelState"], (result) => {
     const prompt = result.pendingPrompt;
     promptInput.value = prompt;
     chrome.storage.session.remove(["pendingPrompt", "panelState"]);
-    showPage("active");
     sendPrompt(prompt);
   } else {
     debug("Side panel loaded");
@@ -506,7 +482,6 @@ chrome.storage.session.get(["pendingPrompt", "panelState"], (result) => {
   statusPollInterval = setInterval(async () => {
     const data = await fetchSessionStatus();
     if (data && data.active) {
-      // Refresh saved sessions list to show updated prompt count
       await fetchSavedSessions();
     }
   }, 5000);

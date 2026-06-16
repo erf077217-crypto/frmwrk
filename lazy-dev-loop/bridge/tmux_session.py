@@ -1,19 +1,23 @@
-from collections.abc import Callable
 import json
 import os
 import re
+import select
 import shlex
 import subprocess
-import tempfile
 import threading
 import time
 import uuid
 
 import config
 import workspace_manager as wm
+from platforms.factory import get_platform
+
+platform = get_platform()
 
 _ANSI_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 TMUX_SESSION_NAME = "lazy-dev-loop"
+_current_session_id: str | None = None
+_session_started_at: float | None = None
 
 
 def strip_ansi(text: str) -> str:
@@ -21,38 +25,20 @@ def strip_ansi(text: str) -> str:
 
 
 def check_tmux() -> bool:
-    cmd = _wsl_cmd("command -v tmux")
-    try:
-        result = subprocess.run(cmd, capture_output=True, encoding='utf-8', timeout=10)
-        return result.returncode == 0 and result.stdout.strip() != ""
-    except Exception:
-        return False
-
-
-def _wsl_cmd(inner: str) -> list[str]:
-    flag = "-ic" if config.USE_INTERACTIVE_SHELL else "-lc"
-    cmd = ["wsl.exe"]
-    if config.WSL_DISTRO:
-        cmd.extend(["-d", config.WSL_DISTRO])
-    cmd.extend(["bash", flag, inner])
-    return cmd
+    return platform.check_command("tmux")
 
 
 def _ensure_tmux() -> bool:
     if check_tmux():
         return True
-    cmd = _wsl_cmd(
-        "sudo apt-get update -qq && sudo apt-get install -y -qq tmux"
-    )
     try:
-        subprocess.run(cmd, capture_output=True, encoding='utf-8', timeout=120)
+        platform.run(
+            "sudo apt-get update -qq && sudo apt-get install -y -qq tmux",
+            timeout=120,
+        )
         return check_tmux()
     except Exception:
         return False
-
-
-def _escape_single_quotes(text: str) -> str:
-    return text.replace("'", "'\\''")
 
 
 def _capture_pane() -> str:
@@ -60,38 +46,165 @@ def _capture_pane() -> str:
     return stdout or ""
 
 
+def _wait_for_opencode_ready(timeout: int = 120) -> bool:
+    """Poll until opencode shows its prompt character in the pane."""
+    deadline = time.monotonic() + timeout
+    t0 = time.monotonic()
+    while time.monotonic() < deadline:
+        content = _capture_pane_with_scrollback(200)
+        if "▣" in content:
+            elapsed = time.monotonic() - t0
+            _dbg(f"_wait_for_opencode_ready: ready after {elapsed:.1f}s")
+            return True
+        time.sleep(0.5)
+    elapsed = time.monotonic() - t0
+    _dbg(f"_wait_for_opencode_ready: TIMEOUT after {elapsed:.1f}s (content={content[-100:]!r})")
+    return False
+
+
 def _tmux(tmux_args: str) -> tuple[str, str, int]:
-    full = f"tmux {tmux_args}"
-    cmd = _wsl_cmd(full)
+    t0 = time.monotonic()
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            encoding='utf-8',
-            timeout=15,
-        )
+        result = platform.run(f"tmux {tmux_args}", timeout=15)
+        elapsed = time.monotonic() - t0
+        if elapsed > 0.5 or "has-session" in tmux_args or "send-keys" in tmux_args:
+            _dbg(f"_tmux({tmux_args[:80]}) took {elapsed:.3f}s rc={result.returncode}")
         return result.stdout, result.stderr, result.returncode
     except subprocess.TimeoutExpired:
+        elapsed = time.monotonic() - t0
+        _dbg(f"_tmux({tmux_args[:80]}) TIMEOUT after {elapsed:.3f}s")
         return "", "timeout", -1
     except FileNotFoundError:
-        return "", "wsl.exe not found", -1
+        return "", platform.env_not_found_message, -1
 
 
 def _opencode_cli(*args: str) -> tuple[str, str, int]:
     inner = " ".join(shlex.quote(a) for a in args)
-    cmd = _wsl_cmd(f"cd /tmp && {config.OPENCODE_COMMAND} {inner} 2>/dev/null")
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            encoding='utf-8',
+        result = platform.run(
+            f"cd /tmp && {_opencode_cmd()} {inner} 2>/dev/null",
             timeout=30,
         )
         return result.stdout, result.stderr, result.returncode
     except subprocess.TimeoutExpired:
         return "", "timeout", -1
     except FileNotFoundError:
-        return "", "wsl.exe not found", -1
+        return "", platform.env_not_found_message, -1
+
+
+def _escape_single_quotes(text: str) -> str:
+    return text.replace("'", "'\\''")
+
+
+def _capture_pane_with_scrollback(scrollback: int = 2000) -> str:
+    stdout, _, _ = _tmux(
+        f"capture-pane -t {TMUX_SESSION_NAME} -p -S -{scrollback}"
+    )
+    return strip_ansi(stdout or "")
+
+
+def _extract_response(pane_content: str, sent_prompt: str) -> str:
+    """Extract latest opencode response text from tmux pane capture.
+
+    Strips ANSI, formatting, timing info, and echoed prompts,
+    returning only the model's response text for the most recent prompt.
+    """
+    lines = pane_content.split("\n")
+    result: list[str] = []
+    in_response = False
+    for line in lines:
+        s = line.strip()
+        if not s:
+            continue
+        # Locate the most recent echoed prompt line
+        if sent_prompt in s:
+            in_response = True
+            result = []
+            continue
+        if not in_response:
+            continue
+        # Stop at the next prompt marker
+        if "▣" in s:
+            break
+        # Skip formatting characters
+        if any(s.startswith(c) for c in ("┃", "╹", "▀", "▄", "▌", "─", "│", "╻")):
+            continue
+        # Skip timing lines
+        if s.startswith("+") and any(
+            w in s for w in ("Thought", "Duration", "Time")
+        ):
+            continue
+        # Skip status-bar artifacts
+        if "ctrl+p" in s or "Build" in s or "◉" in s:
+            continue
+        result.append(s)
+    return (" ".join(result)).strip() if result else ""
+
+
+def _opencode_cmd() -> str:
+    cmd = config.OPENCODE_COMMAND
+    if '/' not in cmd:
+        resolver = getattr(platform, '_resolve_command', None)
+        if resolver:
+            resolved = resolver(cmd)
+            if resolved:
+                _dbg(f"Resolved {cmd} -> {resolved}")
+                return resolved
+    return cmd
+
+
+def _create_session(timeout: int = 120) -> str | None:
+    opencode = _opencode_cmd()
+    inner = (
+        f"{opencode} run --format json "
+        f"{shlex.quote('.')}"
+    )
+    proc = None
+    session_id = None
+    deadline = time.monotonic() + timeout
+    try:
+        proc = platform.popen(
+            inner,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _dbg(f"_create_session: timed out after {timeout}s")
+                break
+            ready, _, _ = select.select([proc.stdout], [], [], remaining)
+            if not ready:
+                _dbg(f"_create_session: timed out after {timeout}s")
+                break
+            raw_line = proc.stdout.readline()
+            if not raw_line:
+                break
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                _dbg(f"_create_session: non-JSON line: {line[:200]}")
+                continue
+            if event.get("type") == "step_start":
+                session_id = event.get("sessionID")
+                break
+
+        if session_id is None:
+            _dbg("_create_session: no step_start found in output")
+
+        return session_id
+    except Exception as exc:
+        _dbg(f"_create_session: exception: {exc}")
+        return None
+    finally:
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
 
 
 def _list_session_ids() -> set[str]:
@@ -102,29 +215,23 @@ def _list_session_ids() -> set[str]:
 
 
 def _session_list() -> list[dict]:
-    stdout, _, rc = _opencode_cli("session", "list")
+    stdout, _, rc = _opencode_cli("session", "list", "--json")
     if rc != 0 or not stdout:
         return []
-    sessions = []
-    for line in stdout.strip().split("\n")[2:]:
-        if not line.strip():
-            continue
-        parts = line.strip().split(None, 1)
-        sid = parts[0]
-        rest = parts[1] if len(parts) > 1 else ""
-        title = rest
-        updated = ""
-        if "  " in rest:
-            idx = rest.rfind("  ")
-            title = rest[:idx]
-            updated = rest[idx:].strip()
-            sessions.append({
-                "session_id": sid,
-                "title": title.strip(),
-            "updated": updated,
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        return []
+    sessions = data if isinstance(data, list) else data.get("sessions", data.get("data", []))
+    out = []
+    for s in sessions:
+        out.append({
+            "session_id": s.get("id") or s.get("session_id", ""),
+            "title": s.get("title", "") or "",
+            "updated": s.get("updatedAt") or s.get("updated", "") or "",
             "source": "opencode",
         })
-    return sessions
+    return out
 
 
 def _normalize_messages(raw_messages: list) -> list[dict]:
@@ -182,33 +289,22 @@ def _session_export(session_id: str) -> dict | None:
 
 class TmuxSession:
 
-    def __init__(self):
-        self.oc_session_id: str | None = None
-        self.started_at: float | None = None
-        self.prompt_count: int = 0
-        self._last_capture: str = ""
-        self.finished: bool = False
-
     @property
     def active(self) -> bool:
         return _tmux(f"has-session -t {TMUX_SESSION_NAME}")[2] == 0
 
-    @property
-    def uptime(self) -> float | None:
-        if self.started_at and self.active and not self.finished:
-            return time.time() - self.started_at
-        return None
-
     # ── lifecycle --------------------------------------------------------
 
     def start(self, session_id: str | None = None) -> dict:
+        global _current_session_id, _session_started_at
+
         if not _ensure_tmux():
             return {
                 "success": False,
                 "error": (
-                    "tmux is required but not found in WSL. "
+                    "tmux is required but not found. "
                     "Install it manually (apt install tmux) or "
-                    "ensure 'command -v tmux' succeeds inside WSL."
+                    "ensure 'command -v tmux' succeeds in the execution environment."
                 ),
             }
 
@@ -223,13 +319,30 @@ class TmuxSession:
         _tmux(f"kill-session -t {TMUX_SESSION_NAME} 2>/dev/null")
         time.sleep(0.5)
 
-        flag = ""
-        if session_id:
-            flag = f"--session {shlex.quote(session_id)}"
+        if not session_id:
+            if not platform.check_command(config.OPENCODE_COMMAND):
+                return {
+                    "success": False,
+                    "error": (
+                        f"OpenCode ({config.OPENCODE_COMMAND}) not found. "
+                        f"Install it or ensure 'command -v {config.OPENCODE_COMMAND}' "
+                        f"succeeds in the execution environment."
+                    ),
+                }
+            session_id = _create_session()
+            if not session_id:
+                return {
+                    "success": False,
+                    "error": (
+                        "Failed to create OpenCode session. "
+                        "Check bridge server logs for details."
+                    ),
+                }
 
+        flag = f"--session {shlex.quote(session_id)}"
         opencode_cmd = (
             f"cd {shlex.quote(wsl_path)} && "
-            f"{config.OPENCODE_COMMAND} {flag}".strip()
+            f"{_opencode_cmd()} {flag}".strip()
         )
         create_out = _tmux(
             f"new-session -d -s {TMUX_SESSION_NAME} {shlex.quote(opencode_cmd)}"
@@ -244,105 +357,37 @@ class TmuxSession:
                 ),
             }
 
-        time.sleep(3)
+        if not _wait_for_opencode_ready():
+            if not self.active:
+                return {
+                    "success": False,
+                    "error": "Session died before opencode became ready",
+                }
+            _dbg("start: proceeding even though opencode prompt not detected")
 
-        if not self.active:
-            return {
-                "success": False,
-                "error": f"Session died after creation: {create_out[1][:200]}",
-            }
-
-        if session_id:
-            self.oc_session_id = session_id
-        else:
-            pane = _capture_pane()
-            match = re.search(r'ses_[a-zA-Z0-9]+', pane)
-            self.oc_session_id = match.group(0) if match else None
-
-        self.started_at = time.time()
-        self.prompt_count = 0
-        self.finished = False
-        self._last_capture = _capture_pane()
+        _current_session_id = session_id
+        _session_started_at = time.monotonic()
 
         return {
             "success": True,
-            "session_id": self.oc_session_id,
+            "session_id": session_id,
             "session_name": TMUX_SESSION_NAME,
         }
 
     def stop(self) -> dict:
+        global _current_session_id, _session_started_at
         _tmux(f"kill-session -t {TMUX_SESSION_NAME} 2>/dev/null")
         time.sleep(0.5)
         if self.active:
             _tmux(f"kill-session -t {TMUX_SESSION_NAME}")
             time.sleep(0.5)
-        self.finished = True
+        sid = _current_session_id
+        _current_session_id = None
+        _session_started_at = None
         return {
             "success": True,
-            "session_id": self.oc_session_id,
+            "session_id": sid,
         }
-
-    # ── prompt -----------------------------------------------------------
-
-    def send_prompt(self, prompt: str, mode: str = "summary") -> dict:
-        if not self.active:
-            return {
-                "success": False,
-                "error": "Session is not active. Start a session first.",
-                "output": "",
-            }
-
-        before = _capture_pane()
-        escaped = _escape_single_quotes(prompt)
-        _tmux(f"send-keys -t {TMUX_SESSION_NAME} '{escaped}' Enter")
-
-        raw_output = self._wait_for_stable_output(before)
-
-        self.prompt_count += 1
-        self._last_capture = _capture_pane()
-
-        if mode == "summary":
-            clean = _extract_assistant_response()
-            if clean:
-                return {"success": True, "output": clean, "source": "export"}
-            final_pane = _capture_pane()
-            filtered = _heuristic_filter(strip_ansi(final_pane))
-            if filtered:
-                return {"success": True, "output": filtered, "source": "filtered"}
-
-        return {"success": True, "output": raw_output.strip(), "source": "raw"}
-
-    def _wait_for_stable_output(
-        self,
-        before: str,
-        on_progress: Callable[[str], None] | None = None,
-        timeout: int | None = None,
-    ) -> str:
-        max_idle = timeout or config.RUN_TIMEOUT
-        deadline = time.time() + max_idle
-        clean_before = strip_ansi(before)
-        clean_last = clean_before
-        stable_since: float | None = None
-
-        while time.time() < deadline:
-            time.sleep(0.25)
-            current = _capture_pane()
-            clean_current = strip_ansi(current)
-
-            if on_progress and clean_current != clean_before:
-                new = self._extract_new(clean_before, clean_current)
-                if new:
-                    on_progress(_heuristic_filter(new.strip()))
-
-            if clean_current == clean_last:
-                if stable_since is not None and time.time() - stable_since >= 3.0:
-                    break
-            else:
-                clean_last = clean_current
-                stable_since = time.time()
-                deadline = max(deadline, time.time() + max_idle)
-
-        return self._extract_new(clean_before, clean_last)
 
     @staticmethod
     def _extract_new(before: str, after: str) -> str:
@@ -357,20 +402,13 @@ class TmuxSession:
 
     def status(self) -> dict:
         active = self.active
-        wsl_workspace = wm.get_workspace()
+        uptime = None
+        if active and _session_started_at:
+            uptime = time.monotonic() - _session_started_at
         return {
-            "active": active and not self.finished,
-            "session_id": self.oc_session_id,
-            "session_name": TMUX_SESSION_NAME,
-            "uptime": self.uptime,
-            "started_at": (
-                time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(self.started_at))
-                if self.started_at
-                else None
-            ),
-            "prompt_count": self.prompt_count,
-            "workspace": wsl_workspace,
-            "source": "opencode",
+            "active": active,
+            "session_id": _current_session_id,
+            "uptime": uptime,
         }
 
     def pane_preview(self, max_lines: int = 5) -> str:
@@ -386,27 +424,17 @@ class TmuxSession:
     # ── terminal ---------------------------------------------------------
 
     def open_terminal(self) -> dict:
+        _dbg(f"TmuxSession.open_terminal: active={self.active} TMUX_SESSION_NAME={TMUX_SESSION_NAME!r}")
         if not self.active:
+            _dbg("TmuxSession.open_terminal: no active session")
             return {
                 "success": False,
                 "error": "No active session to attach to.",
             }
 
-        flag = "-ic" if config.USE_INTERACTIVE_SHELL else "-lc"
-        inner = f"tmux attach -t {TMUX_SESSION_NAME}"
-        cmd = ["wsl.exe"]
-        if config.WSL_DISTRO:
-            cmd.extend(("-d", config.WSL_DISTRO))
-        cmd.extend(("bash", flag, inner))
-
-        try:
-            creationflags = 0
-            if hasattr(subprocess, "CREATE_NEW_CONSOLE"):
-                creationflags = subprocess.CREATE_NEW_CONSOLE
-            subprocess.Popen(cmd, creationflags=creationflags)
-            return {"success": True, "message": "Terminal launched"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+        result = platform.open_terminal(TMUX_SESSION_NAME)
+        _dbg(f"TmuxSession.open_terminal: result={result}")
+        return result
 
 
 # ── module-level singleton ------------------------------------------------
@@ -420,21 +448,13 @@ def get_active() -> TmuxSession:
 
 async def start_session(session_id: str | None = None) -> dict:
     if _active.active:
-        if not _active.finished:
-            return {
-                "success": False,
-                "error": "Session already active. Stop it first.",
-            }
         _active.stop()
     return _active.start(session_id)
 
 
 async def stop_session() -> dict:
-    return _active.stop()
-
-
-async def send_prompt(prompt: str, mode: str = "summary") -> dict:
-    return _active.send_prompt(prompt, mode=mode)
+    _active.stop()
+    return {"success": True}
 
 
 def get_session_status() -> dict:
@@ -454,7 +474,7 @@ def get_session(session_id: str) -> dict | None:
 
 
 async def load_session(session_id: str) -> dict:
-    if _active.active and not _active.finished:
+    if _active.active:
         _active.stop()
     return _active.start(session_id=session_id)
 
@@ -466,242 +486,108 @@ def delete_session(session_id: str) -> dict:
     return {"success": True, "deleted": session_id}
 
 
-# ── output filtering -------------------------------------------------------
-
-_TUI_CHARS = set(
-    "┌┐└┘├┤┬┴┼╒╕╘╛╞╡╪╓╖╙╜╟╢╫"
-    "─═│║╔╗╚╝╠╣╦╩╬▀▄█▌▐░▒▓■●◦◌◆◇▶▷▸►▻"
-)
-
-_BORDER_ONLY_RE = re.compile(
-    r'^[─═┌┐└┘├┤┬┴┼╒╕╘╛╞╡╪╓╖╙╜╟╢╫╔╗╚╝╠╣╦╩╬▀▄█▌▐░▒▓■●\s]+$',
-)
-
-
-def _heuristic_filter(text: str) -> str:
-    lines = text.split("\n")
-    out: list[str] = []
-    in_code = False
-    dropped_lines = 0
-    for line in lines:
-        raw = line.strip()
-        if not raw:
-            continue
-
-        if raw.startswith("```"):
-            in_code = not in_code
-            continue
-        if in_code:
-            continue
-
-        if _BORDER_ONLY_RE.match(raw):
-            dropped_lines += 1
-            continue
-
-        content = raw.strip("".join(_TUI_CHARS) + " \t>")
-
-        if not content:
-            dropped_lines += 1
-            continue
-
-        if re.match(r'^opencode\s+v?\d+', content, re.I):
-            dropped_lines += 1
-            continue
-        if re.match(r'^opencode\s+\d+\.\d+', content, re.I):
-            dropped_lines += 1
-            continue
-
-        if re.match(r'^[d\-lpsbc]\S{9}\s+\d+', content):
-            dropped_lines += 1
-            continue
-        if re.match(r'^total\s+\d+', content, re.I):
-            dropped_lines += 1
-            continue
-
-        first_word = content.split(None, 1)[0].lower().rstrip(":;")
-
-        if first_word in ("read", "write", "shell", "search", "browse",
-                          "edit", "delete", "create", "list", "move", "copy"):
-            if len(content) < 60:
-                dropped_lines += 1
-                continue
-        if first_word in ("file", "directory", "path"):
-            if len(content) < 60:
-                dropped_lines += 1
-                continue
-        if re.match(r'^v?\d+\.\d+', first_word):
-            dropped_lines += 1
-            continue
-        if re.match(r'^\$?[\d.,]+', first_word) and re.match(r'^[\d.,]+$', first_word):
-            dropped_lines += 1
-            continue
-
-        if content.startswith("Press ") or content.startswith("Type "):
-            dropped_lines += 1
-            continue
-
-        out.append(content)
-
-    result = "\n".join(out).strip()
-    _dbg(f"_heuristic_filter: in_lines={len(lines)} dropped={dropped_lines} out_lines={len(out)} out_chars={len(result)}")
-    return result
-
-
-def _extract_assistant_response(session_id: str | None = None, max_attempts: int = 30) -> str | None:
-    sid = session_id or _active.oc_session_id
-    if not sid:
-        _dbg("_extract_assistant_response: no session_id")
-        return None
-
-    _dbg(f"_extract_assistant_response: session={sid} max_attempts={max_attempts}")
-    for i in range(max_attempts):
-        time.sleep(0.5)
-        data = _session_export(sid)
-        if not data:
-            _dbg(f"_extract_assistant_response: attempt {i} — no export data yet")
-            continue
-        messages = data.get("messages", [])
-        for msg in reversed(messages):
-            if msg.get("role") == "assistant":
-                content = msg.get("content", "").strip()
-                if content:
-                    _dbg(f"_extract_assistant_response: found at attempt {i} ({len(content)} chars)")
-                    return content
-    _dbg(f"_extract_assistant_response: exhausted {max_attempts} attempts, no assistant content found")
-    return None
-
-
-# ── background prompt processing (via opencode run --format json) -----------
+# ── background prompt processing (via tmux send-keys + capture-pane) --------
 
 _prompt_state: dict = {}
 _prompt_lock = threading.Lock()
 
 
 def start_prompt_background(prompt: str, mode: str = "summary") -> str:
-    """Run prompt via `opencode run --format json` subprocess.
-
-    Reads structured JSON events from stdout — no tmux, no scraping,
-    no heuristic filters.  The assistant text arrives in a single "text"
-    event once the model finishes generating.
-    """
     global _prompt_state
     prompt_id = uuid.uuid4().hex[:8]
+    _dbg(f"start_prompt_background: prompt_id={prompt_id} mode={mode} prompt={prompt[:60]!r}")
 
-    # Build command:  opencode run --format json [--continue] <prompt>
-    # NOTE: Must use _wsl_cmd() so this works on Windows (where opencode lives in WSL)
-    inner = f"{config.OPENCODE_COMMAND} run --format json"
-    if _active.oc_session_id:
-        inner += " --continue"
-    inner += f" {shlex.quote(prompt)}"
-    cmd = _wsl_cmd(inner)
+    has_sess_t0 = time.monotonic()
+    has_sess_ok = _tmux(f"has-session -t {TMUX_SESSION_NAME}")[2] == 0
+    _dbg(f"start_prompt_background: has-session check took {time.monotonic()-has_sess_t0:.3f}s, result={has_sess_ok}")
+    if not has_sess_ok:
+        with _prompt_lock:
+            _prompt_state = {
+                "prompt_id": prompt_id,
+                "running": False,
+                "done": True,
+                "result": None,
+                "error": "No active tmux session. Start a session first.",
+                "mode": mode,
+            }
+        return prompt_id
 
     def _run():
-        global _prompt_state, _active
-        proc = None
-        _raw_log = None
+        global _prompt_state
         try:
-            _dbg(f"starting: {' '.join(cmd)}")
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                encoding='utf-8',
+            _dbg(f"tmux prompt: send-keys -t {TMUX_SESSION_NAME} '{prompt}'")
+
+            # 0. Wait for opencode to be ready for input
+            if not _wait_for_opencode_ready(timeout=30):
+                with _prompt_lock:
+                    _prompt_state["error"] = "opencode not ready for input after 30s"
+                    _prompt_state["running"] = False
+                    _prompt_state["done"] = True
+                return
+
+            # 2. Send prompt into the running opencode TUI
+            escaped = _escape_single_quotes(prompt)
+            _, stderr, rc = _tmux(
+                f"send-keys -t {TMUX_SESSION_NAME} '{escaped}' Enter"
             )
+            if rc != 0:
+                with _prompt_lock:
+                    _prompt_state["error"] = stderr or "tmux send-keys failed"
+                    _prompt_state["running"] = False
+                    _prompt_state["done"] = True
+                return
 
-            text_parts: list[str] = []
-            _raw_log_path = os.path.join(tempfile.gettempdir(), "opencode_raw_lines.log")
-            _raw_log = open(_raw_log_path, "w", encoding='utf-8')
-            _raw_log.write(f"START cmd={' '.join(cmd)}\n")
+            # 3. Poll capture-pane until the extracted response stabilizes.
+            #    Compare extracted response text (immune to terminal client noise)
+            #    instead of raw pane content.  Require at least one non-empty
+            #    extracted response before declaring stability.
+            deadline = time.time() + 300
+            last_extracted = ""
+            stable_since: float | None = None
+            changed = False
+            poll_count = 0
+            poll_t0 = time.monotonic()
 
-            for raw_line in proc.stdout:
-                _raw_log.write(raw_line)
-                line = raw_line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                event_type = event.get("type")
-                part_type = event.get("part", {}).get("type", "")
-                part_keys = list(event.get("part", {}).keys()) if event.get("part") else []
-
-                # Log every event type and its string content (for TUI leak diagnosis)
-                all_texts = {}
-                def _gather_strings(obj, path=""):
-                    if isinstance(obj, str) and len(obj) > 5:
-                        all_texts[path] = obj[:120]
-                    elif isinstance(obj, dict):
-                        for k, v in obj.items():
-                            _gather_strings(v, f"{path}.{k}")
-                    elif isinstance(obj, list):
-                        for i, v in enumerate(obj):
-                            _gather_strings(v, f"{path}[{i}]")
-                _gather_strings(event)
-                if event_type not in ("step_start", "step_finish") or any("▣" in v or "Build" in v or "OpenCode Zen" in v or "┃" in v for v in all_texts.values()):
-                    for k, v in all_texts.items():
-                        if len(v) >= 10 and not k.startswith(".part.tokens") and not k.startswith(".part.id"):
-                            _dbg(f"  {event_type!r} {k}={v!r}")
-
-                if event_type == "step_start":
-                    sid = event.get("sessionID")
-                    if sid:
-                        _active.oc_session_id = sid
-
-                elif event_type == "text":
-                    part_text = event.get("part", {}).get("text", "")
-                    _dbg(f"  text event: part.type={part_type!r} text_len={len(part_text)} part_type==text={part_type == 'text'}")
-                    if part_type == "text" and part_text:
-                        text_parts.append(part_text)
-                        with _prompt_lock:
-                            _prompt_state["progress"] = "".join(text_parts)
-                            _prompt_state["text_chunks"] = list(text_parts)
-                    elif part_text:
-                        _dbg(f"  *** REJECTED text event (part.type={part_type!r} != 'text') text={part_text[:120]!r}")
-
-                elif event_type == "error":
-                    err = event.get("error", {})
-                    msg = err.get("data", {}).get("message", str(err))
-                    _dbg(f"  error: {msg}")
-                    with _prompt_lock:
-                        _prompt_state["error"] = msg
-
+            while time.time() < deadline:
+                time.sleep(0.25)
+                poll_count += 1
+                current = _capture_pane_with_scrollback(2000)
+                extracted = _extract_response(current, prompt)
+                if extracted == last_extracted:
+                    if changed and stable_since is None:
+                        stable_since = time.time()
+                        _dbg(f"_run: stable start (poll={poll_count}, elapsed={time.monotonic()-poll_t0:.1f}s, extracted={extracted[:60]!r})")
+                    elif changed and time.time() - stable_since >= 1.5:
+                        _dbg(f"_run: stability achieved (poll={poll_count}, elapsed={time.monotonic()-poll_t0:.1f}s)")
+                        break
                 else:
-                    _dbg(f"  UNHANDLED event type={event_type!r} keys={list(event.keys())} part_keys={part_keys}")
+                    last_extracted = extracted
+                    changed = True
+                    stable_since = None
+                    # Update streaming progress
+                    if extracted:
+                        with _prompt_lock:
+                            _prompt_state["progress"] = extracted
+                    if poll_count % 4 == 0:
+                        _dbg(f"_run: content changed (poll={poll_count}, elapsed={time.monotonic()-poll_t0:.1f}s, extracted={extracted[:50]!r})")
 
-            _raw_log.close()
-            _active.prompt_count += 1
-            final_text = "".join(text_parts)
-
-            _dbg(f"_run: result {len(final_text)} chars")
+            # 4. Final result
+            elapsed = time.monotonic() - poll_t0
+            result = last_extracted
+            _dbg(f"_run: done (elapsed={elapsed:.1f}s, polls={poll_count}, result_len={len(result)}, result={result[:80]!r})")
 
             with _prompt_lock:
                 _prompt_state["running"] = False
                 _prompt_state["done"] = True
-                _prompt_state["result"] = final_text.strip()
-                _prompt_state["text_chunks"] = None
+                _prompt_state["result"] = result or None
                 _prompt_state.pop("progress", None)
 
         except Exception as e:
             _dbg(f"_run exception: {e}")
-            if _raw_log:
-                try:
-                    _raw_log.write(f"EXCEPTION: {e}\n")
-                    _raw_log.close()
-                except Exception:
-                    pass
             with _prompt_lock:
                 _prompt_state["error"] = str(e)
                 _prompt_state["running"] = False
                 _prompt_state["done"] = True
-        finally:
-            if proc and proc.returncode is None:
-                try:
-                    proc.kill()
-                except OSError:
-                    pass
 
     with _prompt_lock:
         _prompt_state = {
@@ -722,5 +608,8 @@ def start_prompt_background(prompt: str, mode: str = "summary") -> str:
 def get_prompt_status(prompt_id: str) -> dict:
     with _prompt_lock:
         if _prompt_state.get("prompt_id") != prompt_id:
+            _dbg(f"get_prompt_status({prompt_id}): NOT FOUND, current={_prompt_state.get('prompt_id')}")
             return {"error": "prompt_id not found"}
-        return dict(_prompt_state)
+        state = dict(_prompt_state)
+        _dbg(f"get_prompt_status({prompt_id}): done={state.get('done')} running={state.get('running')} result_len={len(state.get('result','') or '')} error={state.get('error')}")
+        return state

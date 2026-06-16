@@ -492,7 +492,7 @@ wsl bash -ic "opencode run 'Explain this codebase'"
 - [x] Workspace management (`POST /workspace`, `GET /workspace`) with Windows↔WSL path conversion
 - [x] `workspace_manager.py` — path validation, `workspace.json` persistence
 - [x] Persistent OpenCode session via `opencode serve --port <port>` (long-lived engine)
-- [x] `opencode_session.py` — `start()`, `send_prompt()`, `stop()`, `status()`, `open_terminal()`
+- [x] `opencode_session.py` — `start()`, `stop()`, `status()`, `open_terminal()`
 - [x] `POST /session/start` — launches `opencode serve` in workspace
 - [x] `POST /session/prompt` — sends prompt via `opencode run --attach`
 - [x] `GET /session/status` — returns active state, PID, uptime, port, session_id, workspace

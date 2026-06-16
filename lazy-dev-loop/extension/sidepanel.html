@@ -23,7 +23,7 @@
       flex-shrink: 0;
     }
 
-    section { margin-bottom: 8px; }
+    section { margin-bottom: 8px; flex-shrink: 0; }
     section h3 {
       font-size: 12px;
       color: #a6adc8;
@@ -60,11 +60,6 @@
     }
     input[type="text"]:focus { border-color: #cba6f7; }
 
-    .btn-row {
-      display: flex;
-      gap: 6px;
-      margin-top: 6px;
-    }
     button {
       flex: none;
       padding: 7px 12px;
@@ -74,65 +69,58 @@
       font-weight: 600;
       cursor: pointer;
     }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .btn-row {
+      display: flex;
+      gap: 6px;
+      margin-top: 6px;
+    }
     .btn-row button { flex: 1; }
+
     button.primary   { background: #cba6f7; color: #1e1e2e; }
-    button.primary:hover { background: #b4befe; }
+    button.primary:hover:not(:disabled) { background: #b4befe; }
     button.secondary { background: #45475a; color: #cdd6f4; }
-    button.secondary:hover { background: #585b70; }
+    button.secondary:hover:not(:disabled) { background: #585b70; }
     button.accent    { background: #89b4fa; color: #1e1e2e; }
-    button.accent:hover { background: #b4befe; }
+    button.accent:hover:not(:disabled) { background: #b4befe; }
     button.danger    { background: #f38ba8; color: #1e1e2e; }
-    button.danger:hover { background: #eba0ac; }
-    button:disabled  { opacity: 0.4; cursor: not-allowed; }
+    button.danger:hover:not(:disabled) { background: #eba0ac; }
 
-    .page { display: flex; flex-direction: column; flex: 1; min-height: 0; }
-    .page.hidden { display: none; }
-
-    /* ── Page 1 — Session Management ── */
-    #page-mgmt { gap: 8px; }
-
-    .session-list {
-      background: #313244;
-      border: 1px solid #45475a;
-      border-radius: 6px;
-      max-height: 180px;
+    .scroll-area {
+      flex: 1 1 auto;
+      min-height: 0;
       overflow-y: auto;
-    }
-    .session-list-item {
       display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 6px 8px;
+      flex-direction: column;
+    }
+
+    /* ── Status bar ── */
+    #statusBar {
+      flex-shrink: 0;
+      font-size: 11px;
+      padding: 4px 0;
+      color: #6c7086;
+      text-align: center;
       border-bottom: 1px solid #313244;
-      font-size: 11px;
+      margin-bottom: 8px;
     }
-    .session-list-item:last-child { border-bottom: none; }
-    .sli-id    { color: #cdd6f4; font-family: monospace; }
-    .sli-meta  { color: #6c7086; font-size: 10px; margin-top: 1px; }
-    .sli-actions { display: flex; gap: 4px; flex-shrink: 0; }
-    .sli-actions button {
-      flex: none; padding: 2px 7px; font-size: 9px; border-radius: 4px;
-    }
+    .status-ok   { color: #a6e3a1; }
+    .status-err  { color: #f38ba8; }
+    .status-info { color: #89b4fa; }
 
-    .info-panel {
-      background: #313244;
-      border: 1px solid #45475a;
-      border-radius: 6px;
-      padding: 8px;
+    /* ── Session info row ── */
+    #sessionInfo {
       font-size: 11px;
-    }
-    .info-row {
+      color: #6c7086;
+      margin-top: 4px;
       display: flex;
-      justify-content: space-between;
+      gap: 8px;
       align-items: center;
-      padding: 3px 0;
     }
-    .info-row .label { color: #6c7086; }
-    .info-row .value { color: #cdd6f4; font-family: monospace; }
-
-    .badge {
+    #sessionInfo .badge {
       display: inline-block;
-      padding: 2px 8px;
+      padding: 1px 7px;
       border-radius: 10px;
       font-size: 10px;
       font-weight: 600;
@@ -140,21 +128,47 @@
     .badge-active   { background: #a6e3a1; color: #1e1e2e; }
     .badge-inactive { background: #45475a; color: #a6adc8; }
 
-    /* ── Page 2 — Active Session ── */
-    #page-active { gap: 0; }
-
-    .back-link {
-      flex-shrink: 0;
-      background: none; border: none;
-      color: #89b4fa; cursor: pointer;
-      font-size: 11px; font-weight: 600;
-      padding: 0 0 6px 0;
-      text-align: left;
+    /* ── Saved sessions list ── */
+    .session-list {
+      background: #313244;
+      border: 1px solid #45475a;
+      border-radius: 6px;
+      max-height: 140px;
+      overflow-y: auto;
     }
-    .back-link:hover { color: #b4befe; }
+    .session-list-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 5px 8px;
+      border-bottom: 1px solid #313244;
+      font-size: 11px;
+    }
+    .session-list-item:last-child { border-bottom: none; }
+    .sli-id    { color: #cdd6f4; font-family: monospace; font-size: 11px; }
+    .sli-meta  { color: #6c7086; font-size: 10px; margin-top: 1px; }
+    .sli-actions { display: flex; gap: 4px; flex-shrink: 0; }
+    .sli-actions button {
+      flex: none; padding: 2px 7px; font-size: 9px; border-radius: 4px;
+      background: #45475a; color: #cdd6f4; border: none; cursor: pointer;
+    }
+    .sli-actions button:hover { background: #585b70; }
 
-    #promptSection textarea { min-height: 36px; max-height: 72px; }
+    /* ── Workspace ── */
+    .workspace-display {
+      background: #313244;
+      border: 1px solid #45475a;
+      border-radius: 6px;
+      padding: 6px 8px;
+      font-size: 11px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .workspace-path { color: #cdd6f4; font-family: monospace; font-size: 11px; }
+    .workspace-edit { margin-top: 6px; }
 
+    /* ── Viewer ── */
     .viewer {
       background: #313244;
       border: 1px solid #45475a;
@@ -177,21 +191,12 @@
     #responseSection { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
     #responseSection .viewer { flex: 1; min-height: 60px; }
 
-    #status {
-      flex-shrink: 0;
-      font-size: 11px;
-      min-height: 18px;
-      text-align: center;
-      color: #6c7086;
-      margin-top: 4px;
-    }
-    .status-ok   { color: #a6e3a1; }
-    .status-err  { color: #f38ba8; }
-    .status-info { color: #89b4fa; }
+    /* ── Prompt ── */
+    #promptSection textarea { min-height: 36px; max-height: 72px; }
 
+    /* ── Diagnostics ── */
     details { flex-shrink: 0; margin-top: 4px; }
     details summary { cursor: pointer; color: #6c7086; font-size: 11px; }
-
     .debug-row {
       display: flex;
       gap: 6px;
@@ -215,125 +220,89 @@
       color: #6c7086;
     }
     .hidden { display: none; }
-    .mt-2 { margin-top: 6px; }
   </style>
 </head>
 <body>
 
 <h1>Lazy Developer Loop</h1>
 
-<!-- ════════════════════════════════════════════════════════════
-     PAGE 1 — Session Management
-     ════════════════════════════════════════════════════════════ -->
-<div id="page-mgmt" class="page">
+<!-- Status bar -->
+<div id="statusBar">Ready</div>
 
-  <button class="primary" id="newSessionBtn">+ New Session</button>
+<!-- Scrollable content area -->
+<div class="scroll-area">
 
+  <!-- Workspace -->
+  <section>
+    <h3>Workspace</h3>
+    <div class="workspace-display">
+      <span class="workspace-path" id="workspacePath">(not set)</span>
+      <button class="secondary" id="workspaceChangeBtn" style="padding:3px 8px;font-size:10px;">Change</button>
+    </div>
+    <div id="workspaceEditRow" class="hidden workspace-edit">
+      <input type="text" id="workspaceInput" placeholder="/path/to/repo" />
+      <div class="btn-row">
+        <button class="secondary" id="workspaceSetBtn">Set</button>
+        <button class="secondary" id="workspaceCancelBtn">Cancel</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Session Controls -->
+  <section>
+    <h3>Session</h3>
+    <div class="btn-row">
+      <button class="primary" id="newSessionBtn">+ New Session</button>
+      <button class="danger" id="stopSessionBtn" disabled>Stop</button>
+    </div>
+    <div id="sessionInfo">
+      <span class="badge badge-inactive" id="sessionStateBadge">Inactive</span>
+      <span id="sessionIdDisplay">—</span>
+      <span id="sessionUptimeDisplay"></span>
+    </div>
+  </section>
+
+  <!-- Saved Sessions -->
   <section>
     <h3>Saved Sessions</h3>
     <div class="session-list" id="savedSessionList">
-      <div style="color:#585b70;text-align:center;padding:12px;font-size:11px;">
-        No saved sessions
-      </div>
+      <div style="color:#585b70;text-align:center;padding:10px;font-size:11px;">No saved sessions</div>
     </div>
   </section>
-
-  <section>
-    <h3>Workspace</h3>
-    <div class="info-panel">
-      <div class="info-row">
-        <span class="label">Path:</span>
-        <span class="value" id="mgmtWorkspacePath">(not set)</span>
-      </div>
-      <div id="workspaceEditRow" class="hidden" style="margin-top:6px;">
-        <input type="text" id="workspaceInput" placeholder="C:\path\to\repo" />
-        <div class="btn-row">
-          <button class="secondary" id="workspaceSetBtn">Set</button>
-          <button class="secondary" id="workspaceCancelBtn">Cancel</button>
-        </div>
-      </div>
-      <button class="secondary" id="workspaceChangeBtn" style="margin-top:6px;width:100%;">Change Workspace</button>
-    </div>
-  </section>
-
-  <section>
-    <h3>Session</h3>
-    <div class="info-panel" id="mgmtSessionPanel">
-      <div class="info-row">
-        <span class="label">State:</span>
-        <span class="value"><span class="badge badge-inactive" id="mgmtSessionState">Inactive</span></span>
-      </div>
-      <div class="info-row">
-        <span class="label">Session ID:</span>
-        <span class="value" id="mgmtSessionId">—</span>
-      </div>
-      <div class="info-row">
-        <span class="label">Uptime:</span>
-        <span class="value" id="mgmtSessionUptime">—</span>
-      </div>
-      <div class="info-row">
-        <span class="label">Source:</span>
-        <span class="value" id="mgmtSessionSource">—</span>
-      </div>
-      <div class="btn-row" style="margin-top:6px;">
-        <button class="accent" id="mgmtOpenTerminalBtn" disabled>Open Terminal</button>
-      </div>
-    </div>
-  </section>
-</div>
-
-<!-- ════════════════════════════════════════════════════════════
-     PAGE 2 — Active Session
-     ════════════════════════════════════════════════════════════ -->
-<div id="page-active" class="page hidden">
-
-  <button class="back-link" id="backToMgmtBtn">&larr; Sessions</button>
 
   <!-- Prompt -->
   <section id="promptSection">
     <h3>Prompt</h3>
-    <textarea id="promptInput" placeholder="Type or paste a prompt here…"></textarea>
+    <textarea id="promptInput" placeholder="Type or paste a prompt here…" disabled></textarea>
     <div class="btn-row">
-      <button class="primary" id="sendBtn">Send to OpenCode</button>
-    </div>
-  </section>
-
-  <!-- Response (staging area) -->
-  <section id="responseSection">
-    <h3>Response</h3>
-    <textarea class="viewer" id="responseViewer" placeholder="(run a prompt to see the response)" spellcheck="false"></textarea>
-    <div class="btn-row">
-      <button class="secondary" id="insertBtn" disabled>Insert Into ChatGPT</button>
+      <button class="primary" id="sendBtn" disabled>Send to OpenCode</button>
       <button class="secondary" id="modeToggleBtn">Summary</button>
     </div>
   </section>
 
-  <!-- Session info bar -->
-  <section>
-    <div class="info-panel">
-      <div class="info-row">
-        <span class="label">Session:</span>
-        <span class="value" id="activeSessionInfo">Active</span>
-      </div>
-      <div class="btn-row" style="margin-top:4px;">
-        <button class="accent" id="activeOpenTerminalBtn">Open Terminal</button>
-        <button class="danger" id="activeStopBtn">Stop Session</button>
-      </div>
+  <!-- Response -->
+  <section id="responseSection">
+    <h3>Response</h3>
+    <textarea class="viewer" id="responseViewer" placeholder="(start a session and run a prompt)" spellcheck="false" disabled></textarea>
+    <div class="btn-row">
+      <button class="secondary" id="insertBtn" disabled>Insert Into ChatGPT</button>
     </div>
   </section>
+
+  <!-- Terminal -->
+  <section>
+    <button class="accent" id="openTerminalBtn" disabled style="width:100%;">Open Terminal</button>
+  </section>
+
 </div>
 
-<!-- ════════════════════════════════════════════════════════════
-     Shared status + diagnostics
-     ════════════════════════════════════════════════════════════ -->
-<div id="status">Ready</div>
-
+<!-- Diagnostics -->
 <details>
   <summary>Diagnostics</summary>
   <div class="debug-row">
     <button id="pingBtn">Ping ChatGPT</button>
     <button id="tabInfoBtn">Tab Info</button>
-    <button id="refreshBtn">Refresh Status</button>
+    <button id="refreshBtn">Refresh</button>
   </div>
   <div id="debugLog" class="hidden"></div>
 </details>

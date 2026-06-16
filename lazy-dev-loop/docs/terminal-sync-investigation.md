@@ -19,7 +19,7 @@ bridge/main.py (FastAPI, Windows Python)
               └── wsl.exe bash -ic "opencode attach …"        ← terminal TUI client
 ```
 
-**Evidence:** The `start()` method launches serve on port 14096. All subsequent `send_prompt()` and `open_terminal()` calls reference the same port.
+**Evidence:** The `start()` method launches serve on port 14096. All subsequent prompts (via `start_prompt_background` with `--session`) and `open_terminal()` calls reference the same session.
 
 ### 2. Do the extension and terminal share the same session state?
 
@@ -37,7 +37,7 @@ bridge/main.py (FastAPI, Windows Python)
 
 **PARTIALLY.** The `opencode serve` process tracks conversation history internally. Both `run --attach` and `attach --continue` see this history from the server's perspective. However:
 
-- **Extension sees:** Only what the bridge stores in `self.messages` and persisted in `session_store.json`. This is populated only from `send_prompt()` calls made through the extension.
+- **Extension sees:** Only responses from `start_prompt_background` (JSON streaming). Full session history is available via `GET /sessions/{id}` which calls `opencode export`.
 - **Terminal sees:** OpenCode's full internal session history, including any interactions made directly in the TUI.
 
 **Gap:** If a user interacts with OpenCode directly in the terminal TUI, those interactions are NOT reflected in the extension's conversation timeline. The bridge has no way to poll the serve instance for new messages.
