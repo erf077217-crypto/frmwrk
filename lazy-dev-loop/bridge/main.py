@@ -36,6 +36,11 @@ async def health():
     )
 
 
+@app.get("/session/health")
+async def session_health():
+    return ocs.check_session_health()
+
+
 @app.get("/diagnostics")
 async def diagnostics():
     return opencode_runner.run_diagnostics()
@@ -130,6 +135,28 @@ async def session_preview(lines: int = Query(5, ge=1, le=50)):
 @app.post("/terminal/open")
 async def open_terminal():
     return ocs.open_terminal()
+
+
+# ---------------------------------------------------------------------------
+# Debug logging toggle (runtime flag, no restart required)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/debug/status")
+async def debug_status():
+    return {"enabled": ocs.is_debug_enabled()}
+
+
+@app.post("/debug/enable")
+async def debug_enable():
+    ocs.set_debug(True)
+    return {"enabled": True}
+
+
+@app.post("/debug/disable")
+async def debug_disable():
+    ocs.set_debug(False)
+    return {"enabled": False}
 
 
 # ---------------------------------------------------------------------------

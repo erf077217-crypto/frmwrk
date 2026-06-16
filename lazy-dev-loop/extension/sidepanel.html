@@ -108,6 +108,7 @@
     .status-ok   { color: #a6e3a1; }
     .status-err  { color: #f38ba8; }
     .status-info { color: #89b4fa; }
+    .status-warn { color: #f9e2af; }
 
     /* ── Session info row ── */
     #sessionInfo {
@@ -189,11 +190,31 @@
       font-family: monospace;
       line-height: 1.3;
       white-space: pre-wrap;
-      max-height: 80px;
+      max-height: 200px;
       overflow-y: auto;
-      color: #6c7086;
+      color: #a6adc8;
     }
     .hidden { display: none; }
+
+    /* ── Debug checkbox ── */
+    #debugCheckboxRow {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+      margin-top: 4px;
+    }
+    #debugCheckboxRow label {
+      font-size: 11px;
+      color: #6c7086;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    #debugCheckboxRow input[type="checkbox"] {
+      accent-color: #cba6f7;
+    }
   </style>
 </head>
 <body>
@@ -265,6 +286,12 @@
 <!-- Diagnostics -->
 <details>
   <summary>Diagnostics</summary>
+  <div id="debugCheckboxRow">
+    <label>
+      <input type="checkbox" id="debugCheckbox" />
+      Debug Logging
+    </label>
+  </div>
   <div class="debug-row">
     <button id="pingBtn">Ping ChatGPT</button>
     <button id="tabInfoBtn">Tab Info</button>

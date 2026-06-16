@@ -19,6 +19,21 @@ TMUX_SESSION_NAME = "lazy-dev-loop"
 _current_session_id: str | None = None
 _session_started_at: float | None = None
 
+# ── Runtime debug flag (toggled via API, defaults to config) ──────────────
+_debug_enabled = config.DEBUG_OUTPUT
+_debug_lock = threading.Lock()
+
+
+def set_debug(enabled: bool) -> None:
+    global _debug_enabled
+    with _debug_lock:
+        _debug_enabled = enabled
+
+
+def is_debug_enabled() -> bool:
+    with _debug_lock:
+        return _debug_enabled
+
 
 def strip_ansi(text: str) -> str:
     return _ANSI_RE.sub('', text)
@@ -295,27 +310,278 @@ def _normalize_messages(raw_messages: list) -> list[dict]:
 
 
 def _dbg(msg: str):
-    if config.DEBUG_OUTPUT:
+    if is_debug_enabled():
         print(f"[DEBUG tmux_session] {msg}", flush=True)
 
 
+# ── Process discovery / cleanup (platform-independent via platform.run) ────
+
+
+def _find_opencode_processes() -> list[dict]:
+    """Find all opencode processes using pgrep (or ps fallback).
+
+    Works on Linux natively and inside WSL because platform.run()
+    wraps commands in the appropriate shell.
+    """
+    results: list[dict] = []
+    stdout, _, rc = platform.run(
+        "pgrep -af opencode 2>/dev/null || ps aux | grep -v grep | grep opencode",
+        timeout=10,
+    )
+    if rc == 0 and stdout:
+        for line in stdout.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 1)
+            if parts and parts[0].isdigit():
+                pid = int(parts[0])
+                cmd = parts[1] if len(parts) > 1 else ""
+                if "grep" not in cmd and "pgrep" not in cmd:
+                    results.append({"pid": pid, "cmd": cmd})
+    _dbg(f"_find_opencode_processes: found {len(results)} process(es)")
+    for p in results:
+        _dbg(f"_find_opencode_processes:   pid={p['pid']} cmd={p['cmd'][:120]!r}")
+    return results
+
+
+def _kill_process(pid: int, name: str = "") -> bool:
+    """Kill a process by PID.  SIGTERM first, then SIGKILL if still alive."""
+    label = f"pid={pid}"
+    if name:
+        label += f" ({name[:80]})"
+    _dbg(f"KILL: {label}")
+
+    # SIGTERM
+    platform.run(f"kill {pid} 2>/dev/null", timeout=5)
+    time.sleep(0.3)
+
+    # Verify — kill -0 checks existence without sending signal
+    check = platform.run(f"kill -0 {pid} 2>/dev/null", timeout=5)
+    if check.returncode != 0:
+        _dbg(f"KILL: {label} terminated by SIGTERM")
+        return True
+
+    # SIGKILL
+    _dbg(f"KILL: {label} still alive, sending SIGKILL")
+    platform.run(f"kill -9 {pid} 2>/dev/null", timeout=5)
+    time.sleep(0.3)
+
+    check2 = platform.run(f"kill -0 {pid} 2>/dev/null", timeout=5)
+    if check2.returncode != 0:
+        _dbg(f"KILL: {label} terminated by SIGKILL")
+        return True
+
+    _dbg(f"KILL: {label} COULD NOT BE KILLED")
+    return False
+
+
+# ── Session health check ────────────────────────────────────────────────────
+
+
+def check_session_health() -> dict:
+    """Structured health check of the managed session.
+
+    Returns:
+        dict with boolean status per component and diagnostic details.
+    """
+    _dbg("SESSION HEALTH: checking")
+    health: dict = {
+        "tmux_session": False,
+        "tmux_pane": False,
+        "opencode_running": False,
+        "opencode_processes": [],
+        "workspace_set": False,
+        "bridge_state_ok": False,
+        "details": {},
+    }
+
+    # tmux session
+    _, _, rc = _tmux(f"has-session -t {TMUX_SESSION_NAME}")
+    health["tmux_session"] = rc == 0
+    health["details"]["tmux_has_session_rc"] = rc
+    _dbg(f"SESSION HEALTH: tmux session -> {health['tmux_session']} (rc={rc})")
+
+    if health["tmux_session"]:
+        # tmux pane(s)
+        pane_out, _, pane_rc = _tmux(f"list-panes -t {TMUX_SESSION_NAME}")
+        health["tmux_pane"] = pane_rc == 0
+        health["details"]["tmux_list_panes_rc"] = pane_rc
+        health["details"]["tmux_panes"] = pane_out.strip() if pane_out else ""
+        _dbg(f"SESSION HEALTH: tmux panes -> {health['tmux_pane']}")
+    else:
+        health["details"]["tmux_list_panes_rc"] = -1
+
+    # opencode processes
+    oc_procs = _find_opencode_processes()
+    health["opencode_running"] = len(oc_procs) > 0
+    health["opencode_processes"] = oc_procs
+    health["details"]["opencode_process_count"] = len(oc_procs)
+    _dbg(f"SESSION HEALTH: opencode processes -> {len(oc_procs)}")
+
+    # workspace
+    ws = wm.get_workspace()
+    wsl_path = ws.get("wsl_path")
+    health["workspace_set"] = bool(wsl_path)
+    health["details"]["workspace_path"] = wsl_path
+    _dbg(f"SESSION HEALTH: workspace -> {bool(wsl_path)}")
+
+    # bridge state
+    health["bridge_state_ok"] = (
+        health["tmux_session"]
+        and _current_session_id is not None
+        and len(oc_procs) > 0
+    )
+    health["details"]["bridge_session_id"] = _current_session_id
+
+    _dbg(f"SESSION HEALTH: complete -> tmux={health['tmux_session']} "
+         f"opencode={health['opencode_running']} "
+         f"workspace={health['workspace_set']} "
+         f"bridge_ok={health['bridge_state_ok']}")
+    return health
+
+
+# ── Stale-state recovery (idempotent, safe to run repeatedly) ────────────────
+
+
+def _recover_env():
+    """Recovery pass: clean up stale tmux sessions, orphaned opencode
+    processes, and bridge state before creating a new session.
+
+    Idempotent — safe to call multiple times.
+    """
+    _dbg("SESSION RECOVERY: starting")
+    cleaned: dict = {"tmux": False, "opencode": False}
+
+    # 1. Stale tmux session
+    has_tmux = _tmux(f"has-session -t {TMUX_SESSION_NAME}")[2] == 0
+    _dbg(f"SESSION RECOVERY: tmux exists={has_tmux}")
+    if has_tmux:
+        _dbg("SESSION RECOVERY: killing stale tmux session")
+        _tmux(f"kill-session -t {TMUX_SESSION_NAME} 2>/dev/null")
+        time.sleep(0.5)
+        still = _tmux(f"has-session -t {TMUX_SESSION_NAME}")[2] == 0
+        if still:
+            _dbg("SESSION RECOVERY: retrying tmux kill")
+            _tmux(f"kill-session -t {TMUX_SESSION_NAME} 2>/dev/null")
+            time.sleep(0.5)
+        cleaned["tmux"] = True
+    else:
+        _dbg("SESSION RECOVERY: no stale tmux session")
+
+    # 2. Orphaned opencode processes (not inside our tmux)
+    oc_procs = _find_opencode_processes()
+    if oc_procs:
+        _dbg(f"SESSION RECOVERY: killing {len(oc_procs)} orphaned opencode process(es)")
+        for proc in oc_procs:
+            _kill_process(proc["pid"], proc.get("cmd", ""))
+        cleaned["opencode"] = True
+    else:
+        _dbg("SESSION RECOVERY: no orphaned opencode processes")
+
+    # 3. Reset bridge state unconditionally
+    global _current_session_id, _session_started_at
+    old_sid = _current_session_id
+    _current_session_id = None
+    _session_started_at = None
+    if old_sid is not None:
+        _dbg(f"SESSION RECOVERY: cleared stale bridge session_id={old_sid}")
+
+    # 4. Clear any in-flight prompt state
+    _reset_prompt_state()
+
+    _dbg(f"SESSION RECOVERY: complete (tmux={cleaned['tmux']} opencode={cleaned['opencode']})")
+
+
+def _reset_prompt_state():
+    """Safely clear any in-flight prompt state."""
+    global _prompt_state
+    with _prompt_lock:
+        if _prompt_state.get("running"):
+            _dbg(f"SESSION RECOVERY: clearing in-flight prompt {_prompt_state.get('prompt_id')}")
+        _prompt_state = {}
+
+
+# ── Verified shutdown (stops and verifies cleanup) ─────────────────────────
+
+
+def _verified_shutdown() -> dict:
+    """Shut down the managed session with verification.
+
+    1. Kill tmux session (with retry)
+    2. Verify tmux is dead
+    3. Kill orphaned opencode processes
+    4. Clear bridge state
+    """
+    global _current_session_id, _session_started_at
+    sid = _current_session_id
+    _dbg("SESSION SHUTDOWN: starting")
+
+    # Step A — kill tmux session
+    _dbg("SESSION SHUTDOWN: killing tmux session")
+    _tmux(f"kill-session -t {TMUX_SESSION_NAME} 2>/dev/null")
+    time.sleep(0.5)
+
+    # Step B — verify tmux is gone, retry up to 3×
+    for attempt in range(3):
+        alive = _tmux(f"has-session -t {TMUX_SESSION_NAME}")[2] == 0
+        _dbg(f"SESSION SHUTDOWN: tmux alive check #{attempt + 1}: alive={alive}")
+        if not alive:
+            break
+        _tmux(f"kill-session -t {TMUX_SESSION_NAME} 2>/dev/null")
+        time.sleep(0.5)
+
+    # Step C — kill orphaned opencode processes
+    oc_procs = _find_opencode_processes()
+    if oc_procs:
+        _dbg(f"SESSION SHUTDOWN: killing {len(oc_procs)} orphaned opencode process(es)")
+        for proc in oc_procs:
+            _kill_process(proc["pid"], proc.get("cmd", ""))
+    else:
+        _dbg("SESSION SHUTDOWN: no orphaned opencode processes")
+
+    # Step D — clear bridge state and in-flight prompts
+    _current_session_id = None
+    _session_started_at = None
+    _reset_prompt_state()
+    _dbg("SESSION SHUTDOWN: complete")
+
+    return {"success": True, "session_id": sid}
+
+
 def _session_export(session_id: str) -> dict | None:
-    stdout, _, rc = _opencode_cli("export", session_id)
+    stdout, stderr, rc = _opencode_cli("export", session_id)
     if rc != 0 or not stdout:
-        _dbg(f"_session_export({session_id}): rc={rc} stdout_empty={not stdout}")
+        _dbg(f"_session_export({session_id}): rc={rc} stdout_empty={not stdout} stderr={stderr!r}")
         return None
+
+    raw_size = len(stdout)
+    _dbg(f"_session_export({session_id}): raw_size={raw_size}")
+
+    # Trim "Exporting session..." header line if present
     lines = stdout.split("\n")
     if lines and lines[0].startswith("Exporting session"):
         stdout = "\n".join(lines[1:])
+
     try:
         data = json.loads(stdout)
     except json.JSONDecodeError as e:
+        pos = e.pos
+        context_before = stdout[max(0, pos - 200):pos]
+        context_after = stdout[pos:pos + 200]
+        tail = stdout[-1000:]
         _dbg(f"_session_export({session_id}): JSON decode error: {e}")
+        _dbg(f"_session_export({session_id}): error_position={pos} raw_size={raw_size}")
+        _dbg(f"_session_export({session_id}): context_before={context_before[-200:]!r}")
+        _dbg(f"_session_export({session_id}): context_after={context_after[:200]!r}")
+        _dbg(f"_session_export({session_id}): tail={tail!r}")
         return None
+
     info = data.get("info", {})
     raw_messages = data.get("messages", [])
     norm = _normalize_messages(raw_messages)
-    _dbg(f"_session_export({session_id}): {len(norm)} messages, roles={[m['role'] for m in norm]}")
+    msg_count = len(norm)
+    _dbg(f"_session_export({session_id}): {msg_count} messages, roles={[m['role'] for m in norm]}")
     return {
         "session_id": info.get("id"),
         "title": info.get("title"),
@@ -342,6 +608,10 @@ class TmuxSession:
     def start(self, session_id: str | None = None) -> dict:
         global _current_session_id, _session_started_at
 
+        # Recovery pass — clean stale state so startup never fails
+        # due to incomplete previous cleanup.
+        _recover_env()
+
         if not _ensure_tmux():
             return {
                 "success": False,
@@ -361,8 +631,6 @@ class TmuxSession:
             }
 
         _tmux("set -g history-limit 50000 2>/dev/null")
-        _tmux(f"kill-session -t {TMUX_SESSION_NAME} 2>/dev/null")
-        time.sleep(0.5)
 
         if not session_id:
             if not platform.check_command(config.OPENCODE_COMMAND):
@@ -418,19 +686,7 @@ class TmuxSession:
         }
 
     def stop(self) -> dict:
-        global _current_session_id, _session_started_at
-        _tmux(f"kill-session -t {TMUX_SESSION_NAME} 2>/dev/null")
-        time.sleep(0.5)
-        if self.active:
-            _tmux(f"kill-session -t {TMUX_SESSION_NAME}")
-            time.sleep(0.5)
-        sid = _current_session_id
-        _current_session_id = None
-        _session_started_at = None
-        return {
-            "success": True,
-            "session_id": sid,
-        }
+        return _verified_shutdown()
 
     @staticmethod
     def _extract_new(before: str, after: str) -> str:
@@ -490,14 +746,17 @@ def get_active() -> TmuxSession:
 
 
 async def start_session(session_id: str | None = None) -> dict:
-    if _active.active:
-        _active.stop()
+    # Idempotent: start() runs its own recovery pass, so calling
+    # stop() here is redundant but harmless.  Keep it for backward
+    # compatibility — the recovery pass inside start() handles
+    # everything that stop() used to do.
     return _active.start(session_id)
 
 
 async def stop_session() -> dict:
-    _active.stop()
-    return {"success": True}
+    # Idempotent: stop() does verification and recovery.
+    # Calling it with nothing to stop is safe.
+    return _active.stop()
 
 
 def get_session_status() -> dict:
@@ -517,11 +776,11 @@ _prompt_lock = threading.Lock()
 def start_prompt_background(prompt: str, mode: str = "summary") -> str:
     global _prompt_state
     prompt_id = uuid.uuid4().hex[:8]
-    _dbg(f"start_prompt_background: prompt_id={prompt_id} mode={mode} prompt={prompt[:60]!r}")
+    _dbg(f"PROMPT[{prompt_id}] created mode={mode} prompt={prompt[:60]!r}")
 
     has_sess_t0 = time.monotonic()
     has_sess_ok = _tmux(f"has-session -t {TMUX_SESSION_NAME}")[2] == 0
-    _dbg(f"start_prompt_background: has-session check took {time.monotonic()-has_sess_t0:.3f}s, result={has_sess_ok}")
+    _dbg(f"PROMPT[{prompt_id}] has-session: {has_sess_ok} ({time.monotonic()-has_sess_t0:.3f}s)")
     if not has_sess_ok:
         with _prompt_lock:
             _prompt_state = {
@@ -534,115 +793,151 @@ def start_prompt_background(prompt: str, mode: str = "summary") -> str:
             }
         return prompt_id
 
+    def _is_session_alive() -> bool:
+        return _tmux(f"has-session -t {TMUX_SESSION_NAME}")[2] == 0
+
     def _run():
         global _prompt_state
+        completion_reason = None
         try:
-            _dbg(f"tmux prompt: send-keys -t {TMUX_SESSION_NAME} '{prompt}'")
+            _dbg(f"PROMPT[{prompt_id}] queued")
 
             # 1. Send prompt into the running opencode TUI
+            send_t0 = time.monotonic()
             escaped = _escape_single_quotes(prompt)
             _, stderr, rc = _tmux(
                 f"send-keys -t {TMUX_SESSION_NAME} '{escaped}' Enter"
             )
+            send_elapsed = time.monotonic() - send_t0
+            _dbg(f"PROMPT[{prompt_id}] send-keys rc={rc} took={send_elapsed*1000:.0f}ms")
             if rc != 0:
+                completion_reason = "send-keys-failed"
+                _dbg(f"PROMPT[{prompt_id}] send-keys-failed stderr={stderr!r}")
                 with _prompt_lock:
                     _prompt_state["error"] = stderr or "tmux send-keys failed"
                     _prompt_state["running"] = False
                     _prompt_state["done"] = True
                 return
 
-            # 2. Poll capture-pane until the extracted response stabilizes.
-            #    Compare extracted response text (immune to terminal client noise)
-            #    instead of raw pane content.  Require at least one non-empty
-            #    extracted response before declaring stability.
-            deadline = time.time() + 300
+            # 2. Poll capture-pane until stability or session death.
+            #    NO WALL-CLOCK TIMEOUT.
             last_extracted = ""
             stable_since: float | None = None
             changed = False
             saw_prompt_char = False
+            session_alive = True
             poll_count = 0
             poll_t0 = time.monotonic()
+            last_progress_report = 0.0
 
-            while time.time() < deadline:
+            while True:
                 time.sleep(0.25)
                 poll_count += 1
+
+                # Check session health every 20 polls (~5s)
+                if poll_count % 20 == 0:
+                    if not _is_session_alive():
+                        completion_reason = "session-died"
+                        session_alive = False
+                        _dbg(f"PROMPT[{prompt_id}] session-died (poll={poll_count} elapsed={time.monotonic()-poll_t0:.1f}s)")
+                        break
+
+                cap_t0 = time.monotonic()
                 current = _capture_pane_with_scrollback()
+                cap_elapsed = time.monotonic() - cap_t0
+                capture_size = len(current)
+                last_line = (current.strip().split("\n") or [""])[-1][:120]
                 extracted = _extract_response(current, prompt)
+                extracted_len = len(extracted)
+                new_lines = extracted_len - len(last_extracted)
+
+                _dbg(f"PROMPT[{prompt_id}] capture size={capture_size} last={last_line!r} extracted={extracted_len} new={new_lines} stable={stable_since is not None} changed={changed} saw_prompt={'▣' in current} cap_took={cap_elapsed*1000:.0f}ms")
 
                 # Track whether ▣ prompt character has reappeared (signals completion)
                 if "▣" in current:
                     saw_prompt_char = True
 
-                # Only consider non-trivial extracted text as meaningful content
-                is_meaningful = len(extracted) >= 20
+                is_meaningful = extracted_len >= 20
 
                 if extracted == last_extracted:
-                    # Stability detected: content unchanged between polls
                     if not changed:
-                        # Still waiting for first meaningful content
                         pass
                     elif stable_since is None:
                         stable_since = time.time()
-                        _dbg(f"_run: stable start (poll={poll_count}, elapsed={time.monotonic()-poll_t0:.1f}s, extracted={extracted[:60]!r})")
+                        _dbg(f"PROMPT[{prompt_id}] stable start (poll={poll_count}, elapsed={time.monotonic()-poll_t0:.1f}s, extracted={extracted[:80]!r})")
                     elif time.time() - stable_since >= 1.5:
-                        # Only complete if we have meaningful content OR ▣ reappeared
                         if is_meaningful or saw_prompt_char:
-                            _dbg(f"_run: stability achieved (poll={poll_count}, elapsed={time.monotonic()-poll_t0:.1f}s)")
+                            completion_reason = "stable-complete" if is_meaningful else "prompt-char-seen"
+                            _dbg(f"PROMPT[{prompt_id}] completion_reason={completion_reason} (poll={poll_count}, elapsed={time.monotonic()-poll_t0:.1f}s)")
                             break
                 else:
                     last_extracted = extracted
                     stable_since = None
-                    # Only mark as changed if content is meaningful
-                    if len(extracted) >= 20:
+                    if extracted_len >= 20:
                         changed = True
-                    # Update streaming progress even for partial content
                     if extracted:
                         with _prompt_lock:
                             _prompt_state["progress"] = extracted
-                    if poll_count % 4 == 0:
-                        _dbg(f"_run: content changed (poll={poll_count}, elapsed={time.monotonic()-poll_t0:.1f}s, extracted={extracted[:50]!r})")
+                    elapsed = time.monotonic() - poll_t0
+                    if elapsed - last_progress_report >= 30.0:
+                        last_progress_report = elapsed
+                        _dbg(f"PROMPT[{prompt_id}] progress (poll={poll_count}, elapsed={elapsed:.1f}s, extracted_len={extracted_len})")
 
             # 3. Final result — use opencode export for ground truth
             elapsed = time.monotonic() - poll_t0
             result = last_extracted
-
-            # After completion, export the session for the definitive full response.
-            # Pane extraction during generation only sees the visible 25-line window
-            # (opencode is a full-screen TUI; tmux scrollback is empty), so the
-            # extracted result may be only the last visible fragment.  The export
-            # gives the complete assistant reply from opencode's internal data.
+            export_success = False
             sid = _current_session_id
-            if sid:
-                _dbg(f"_run: fetching export for session {sid}")
+
+            # Only attempt export if session is alive — dead sessions won't export
+            if sid and session_alive:
+                _dbg(f"PROMPT[{prompt_id}] export start session={sid}")
                 exported = _session_export(sid)
-                if exported:
+                max_retries = 10
+                for retry in range(max_retries):
+                    if exported is not None:
+                        export_success = True
+                        break
+                    _dbg(f"PROMPT[{prompt_id}] export retry {retry + 1}/{max_retries} session={sid}")
+                    time.sleep(2.0)
+                    exported = _session_export(sid)
+
+                if export_success:
                     msgs = exported.get("messages", [])
                     for m in reversed(msgs):
                         if m.get("role") == "assistant" and m.get("content", "").strip():
                             reply = m["content"].strip()
                             if len(reply) >= len(result):
                                 result = reply
-                                _dbg(f"_run: export reply (len={len(result)}) replaces pane extraction (len={len(last_extracted)})")
+                                _dbg(f"PROMPT[{prompt_id}] export reply (len={len(result)}) replaces pane (len={len(last_extracted)})")
                             else:
-                                _dbg(f"_run: keeping pane extraction (len={len(result)}) > export reply (len={len(reply)})")
+                                _dbg(f"PROMPT[{prompt_id}] keeping pane (len={len(result)}) > export reply (len={len(reply)})")
                             break
 
-            _dbg(f"_run: done (elapsed={elapsed:.1f}s, polls={poll_count}, result_len={len(result)}, result={result[:80]!r})")
+            if completion_reason is None:
+                completion_reason = "unknown"
+
+            _dbg(f"PROMPT[{prompt_id}] done elapsed={elapsed:.1f}s polls={poll_count} result_len={len(result)} reason={completion_reason} export_ok={export_success}")
 
             with _prompt_lock:
                 _prompt_state["running"] = False
                 _prompt_state["done"] = True
+                _prompt_state["completion_reason"] = completion_reason
+                _prompt_state["export_success"] = export_success
                 _prompt_state["result"] = result or None
                 _prompt_state.pop("progress", None)
 
         except Exception as e:
-            _dbg(f"_run exception: {e}")
+            completion_reason = "exception"
+            _dbg(f"PROMPT[{prompt_id}] exception: {e}")
             with _prompt_lock:
+                _prompt_state["completion_reason"] = completion_reason
                 _prompt_state["error"] = str(e)
                 _prompt_state["running"] = False
                 _prompt_state["done"] = True
 
     with _prompt_lock:
+        _dbg(f"PROMPT[{prompt_id}] started")
         _prompt_state = {
             "prompt_id": prompt_id,
             "running": True,
@@ -661,8 +956,11 @@ def start_prompt_background(prompt: str, mode: str = "summary") -> str:
 def get_prompt_status(prompt_id: str) -> dict:
     with _prompt_lock:
         if _prompt_state.get("prompt_id") != prompt_id:
-            _dbg(f"get_prompt_status({prompt_id}): NOT FOUND, current={_prompt_state.get('prompt_id')}")
+            _dbg(f"PROMPT[{prompt_id}] NOT FOUND, current={_prompt_state.get('prompt_id')}")
             return {"error": "prompt_id not found"}
         state = dict(_prompt_state)
-        _dbg(f"get_prompt_status({prompt_id}): done={state.get('done')} running={state.get('running')} result_len={len(state.get('result','') or '')} error={state.get('error')}")
+        done = state.get('done')
+        running = state.get('running')
+        result_len = len(state.get('result', '') or '')
+        _dbg(f"PROMPT[{prompt_id}] status done={done} running={running} result_len={result_len}")
         return state

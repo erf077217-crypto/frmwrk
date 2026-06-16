@@ -38,9 +38,69 @@ const pingBtn            = document.getElementById("pingBtn");
 const tabInfoBtn         = document.getElementById("tabInfoBtn");
 const refreshBtn         = document.getElementById("refreshBtn");
 
+// Debug
+const debugCheckbox      = document.getElementById("debugCheckbox");
+
 // ── State ─────────────────────────────────────────────────────────────────
 
 let statusPollInterval = null;
+
+// ── Debug logging ─────────────────────────────────────────────────────────
+
+const MAX_LOG_ENTRIES = 1000;
+let debugLogBuffer = [];
+let debugEnabled = false;
+
+function debug(msg) {
+  const entry = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  debugLogBuffer.push(entry);
+  if (debugLogBuffer.length > MAX_LOG_ENTRIES) {
+    debugLogBuffer.shift();
+  }
+  if (debugEnabled) {
+    debugLog.classList.remove("hidden");
+    debugLog.textContent = debugLogBuffer.join("\n");
+    debugLog.scrollTop = debugLog.scrollHeight;
+  }
+}
+
+function setDebugUI(enabled) {
+  debugEnabled = enabled;
+  debugCheckbox.checked = enabled;
+  if (!enabled) {
+    debugLog.textContent = "";
+    debugLog.classList.add("hidden");
+  } else if (debugLogBuffer.length > 0) {
+    debugLog.classList.remove("hidden");
+    debugLog.textContent = debugLogBuffer.join("\n");
+    debugLog.scrollTop = debugLog.scrollHeight;
+  }
+}
+
+async function fetchDebugStatus() {
+  try {
+    const r = await fetch(`${BRIDGE}/debug/status`);
+    const data = await r.json();
+    setDebugUI(data.enabled === true);
+  } catch (err) {
+    // bridge not reachable — keep current state
+  }
+}
+
+async function toggleDebug(enabled) {
+  try {
+    const endpoint = enabled ? "enable" : "disable";
+    await fetch(`${BRIDGE}/debug/${endpoint}`, { method: "POST" });
+    setDebugUI(enabled);
+    if (enabled) debug("Debug logging enabled");
+  } catch (err) {
+    setStatus(`Error: ${err.message}`, "status-err");
+  }
+}
+
+debugCheckbox.addEventListener("change", () => {
+  toggleDebug(debugCheckbox.checked);
+});
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -200,9 +260,13 @@ async function sendPrompt(prompt) {
         } else {
           const finalText = ps.result || ps.progress || "";
           responseViewer.value = finalText || "(no output)";
-          debug(`Response: ${finalText.length} chars`);
+          debug(`Response: ${finalText.length} chars, reason=${ps.completion_reason}, export_ok=${ps.export_success}`);
           if (finalText) {
-            setStatus("Response ready", "status-ok");
+            if (ps.export_success === false) {
+              setStatus("Response ready (export failed)", "status-warn");
+            } else {
+              setStatus("Response ready", "status-ok");
+            }
             insertBtn.disabled = false;
           } else {
             setStatus("Empty response", "status-err");
@@ -384,12 +448,11 @@ chrome.storage.session.get(["pendingPrompt", "panelState"], (result) => {
     promptInput.value = prompt;
     chrome.storage.session.remove(["pendingPrompt", "panelState"]);
     sendPrompt(prompt);
-  } else {
-    debug("Side panel loaded");
   }
 
   fetchWorkspace();
   fetchSessionStatus();
+  fetchDebugStatus();
 
   statusPollInterval = setInterval(fetchSessionStatus, 5000);
 });
