@@ -238,6 +238,40 @@ def _opencode_cmd() -> str:
     return cmd
 
 
+# ── Busy/idle detection for completion state machine ────────────────────────
+
+
+def _has_busy_indicators(pane_content: str) -> bool:
+    """Check if OpenCode is showing busy indicators in the visible pane area.
+
+    Returns True if OpenCode is still processing even though
+    visible output may not be changing.
+    """
+    lines = pane_content.split("\n")
+    visible = lines[-10:] if len(lines) >= 10 else lines
+    for line in visible:
+        if "esc interrupt" in line:
+            return True
+        s = line.strip()
+        if not s:
+            continue
+        for c in ('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'):
+            if c in s:
+                return True
+        if '■' in s or '⬝' in s:
+            return True
+    return False
+
+
+def _has_idle_prompt(pane_content: str) -> bool:
+    """Check if OpenCode has returned to idle (prompt character visible at pane bottom)."""
+    lines = pane_content.split("\n")
+    for line in lines[-5:]:
+        if "▣" in line:
+            return True
+    return False
+
+
 def _create_session(timeout: int = 120, cwd: str | None = None) -> str | None:
     opencode = _opencode_cmd()
     inner = (
@@ -821,16 +855,21 @@ def start_prompt_background(prompt: str, mode: str = "summary") -> str:
                     _prompt_state["done"] = True
                 return
 
-            # 2. Poll capture-pane until stability or session death.
-            #    NO WALL-CLOCK TIMEOUT.
+            # 2. Poll capture-pane with state machine.
+            #    NO WALL-CLOCK TIMEOUT. Completion requires idle state.
+            _STATE_WAITING = "WAITING_FOR_FIRST_OUTPUT"
+            _STATE_GENERATING = "GENERATING"
+            _STATE_BUSY = "BUSY_NO_VISIBLE_OUTPUT"
+            _STATE_COMPLETING = "COMPLETING"
+
             last_extracted = ""
-            stable_since: float | None = None
-            changed = False
-            saw_prompt_char = False
             session_alive = True
             poll_count = 0
             poll_t0 = time.monotonic()
             last_progress_report = 0.0
+            state = _STATE_WAITING
+            completing_since: float | None = None
+            confirm_period = 2.0
 
             while True:
                 time.sleep(0.25)
@@ -853,37 +892,82 @@ def start_prompt_background(prompt: str, mode: str = "summary") -> str:
                 extracted_len = len(extracted)
                 new_lines = extracted_len - len(last_extracted)
 
-                _dbg(f"PROMPT[{prompt_id}] capture size={capture_size} last={last_line!r} extracted={extracted_len} new={new_lines} stable={stable_since is not None} changed={changed} saw_prompt={'▣' in current} cap_took={cap_elapsed*1000:.0f}ms")
-
-                # Track whether ▣ prompt character has reappeared (signals completion)
-                if "▣" in current:
-                    saw_prompt_char = True
-
+                # Detect signals
+                has_idle_prompt = _has_idle_prompt(current)
+                is_busy = _has_busy_indicators(current)
+                text_changed = extracted != last_extracted
                 is_meaningful = extracted_len >= 20
 
-                if extracted == last_extracted:
-                    if not changed:
-                        pass
-                    elif stable_since is None:
-                        stable_since = time.time()
-                        _dbg(f"PROMPT[{prompt_id}] stable start (poll={poll_count}, elapsed={time.monotonic()-poll_t0:.1f}s, extracted={extracted[:80]!r})")
-                    elif time.time() - stable_since >= 1.5:
-                        if is_meaningful or saw_prompt_char:
-                            completion_reason = "stable-complete" if is_meaningful else "prompt-char-seen"
-                            _dbg(f"PROMPT[{prompt_id}] completion_reason={completion_reason} (poll={poll_count}, elapsed={time.monotonic()-poll_t0:.1f}s)")
-                            break
-                else:
+                _dbg(f"PROMPT[{prompt_id}] state={state} capture size={capture_size} last={last_line!r} extracted={extracted_len} new={new_lines} idle_prompt={has_idle_prompt} busy={is_busy} cap_took={cap_elapsed*1000:.0f}ms")
+
+                if is_busy:
+                    _dbg(f"PROMPT[{prompt_id}] busy_indicator_detected=True")
+                if has_idle_prompt:
+                    _dbg(f"PROMPT[{prompt_id}] idle_prompt_detected=True")
+
+                # ── State machine ──────────────────────────────────────
+
+                if text_changed:
                     last_extracted = extracted
-                    stable_since = None
-                    if extracted_len >= 20:
-                        changed = True
                     if extracted:
                         with _prompt_lock:
                             _prompt_state["progress"] = extracted
-                    elapsed = time.monotonic() - poll_t0
-                    if elapsed - last_progress_report >= 30.0:
-                        last_progress_report = elapsed
-                        _dbg(f"PROMPT[{prompt_id}] progress (poll={poll_count}, elapsed={elapsed:.1f}s, extracted_len={extracted_len})")
+
+                if state == _STATE_WAITING:
+                    if is_meaningful:
+                        state = _STATE_GENERATING
+                        _dbg(f"PROMPT[{prompt_id}] state_transition: WAITING -> GENERATING")
+                    elif has_idle_prompt and not is_busy:
+                        state = _STATE_COMPLETING
+                        completing_since = time.monotonic()
+                        _dbg(f"PROMPT[{prompt_id}] state_transition: WAITING -> COMPLETING")
+                        _dbg(f"PROMPT[{prompt_id}] completion_confirmed_reason=idle_prompt")
+
+                elif state == _STATE_GENERATING:
+                    if text_changed:
+                        elapsed = time.monotonic() - poll_t0
+                        if elapsed - last_progress_report >= 30.0:
+                            last_progress_report = elapsed
+                            _dbg(f"PROMPT[{prompt_id}] progress (poll={poll_count}, elapsed={elapsed:.1f}s, extracted_len={extracted_len})")
+                    elif has_idle_prompt and not is_busy:
+                        state = _STATE_COMPLETING
+                        completing_since = time.monotonic()
+                        _dbg(f"PROMPT[{prompt_id}] state_transition: GENERATING -> COMPLETING")
+                        _dbg(f"PROMPT[{prompt_id}] completion_confirmed_reason=idle_prompt")
+                    elif is_busy:
+                        state = _STATE_BUSY
+                        _dbg(f"PROMPT[{prompt_id}] state_transition: GENERATING -> BUSY_NO_VISIBLE_OUTPUT")
+                        _dbg(f"PROMPT[{prompt_id}] completion_blocked_reason=busy_indicator")
+
+                elif state == _STATE_BUSY:
+                    if text_changed:
+                        state = _STATE_GENERATING
+                        _dbg(f"PROMPT[{prompt_id}] state_transition: BUSY_NO_VISIBLE_OUTPUT -> GENERATING")
+                    elif has_idle_prompt and not is_busy:
+                        state = _STATE_COMPLETING
+                        completing_since = time.monotonic()
+                        _dbg(f"PROMPT[{prompt_id}] state_transition: BUSY_NO_VISIBLE_OUTPUT -> COMPLETING")
+                        _dbg(f"PROMPT[{prompt_id}] completion_confirmed_reason=idle_prompt")
+
+                elif state == _STATE_COMPLETING:
+                    if text_changed:
+                        state = _STATE_GENERATING
+                        completing_since = None
+                        _dbg(f"PROMPT[{prompt_id}] state_transition: COMPLETING -> GENERATING (text resumed)")
+                    elif is_busy:
+                        state = _STATE_BUSY
+                        completing_since = None
+                        _dbg(f"PROMPT[{prompt_id}] state_transition: COMPLETING -> BUSY_NO_VISIBLE_OUTPUT")
+                        _dbg(f"PROMPT[{prompt_id}] completion_blocked_reason=busy_indicator")
+                    elif not has_idle_prompt:
+                        state = _STATE_BUSY
+                        completing_since = None
+                        _dbg(f"PROMPT[{prompt_id}] state_transition: COMPLETING -> BUSY_NO_VISIBLE_OUTPUT (idle lost)")
+                        _dbg(f"PROMPT[{prompt_id}] completion_blocked_reason=no_idle_prompt")
+                    elif completing_since is not None and (time.monotonic() - completing_since) >= confirm_period:
+                        completion_reason = "idle-complete"
+                        _dbg(f"PROMPT[{prompt_id}] completion_reason={completion_reason} (idle_for={time.monotonic()-completing_since:.1f}s)")
+                        break
 
             # 3. Final result — use opencode export for ground truth
             elapsed = time.monotonic() - poll_t0
