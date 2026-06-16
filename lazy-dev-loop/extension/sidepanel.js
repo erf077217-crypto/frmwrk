@@ -20,9 +20,6 @@ const sessionStateBadge  = document.getElementById("sessionStateBadge");
 const sessionIdDisplay   = document.getElementById("sessionIdDisplay");
 const sessionUptimeDisplay = document.getElementById("sessionUptimeDisplay");
 
-// Saved sessions
-const savedSessionList   = document.getElementById("savedSessionList");
-
 // Prompt
 const promptInput        = document.getElementById("promptInput");
 const sendBtn            = document.getElementById("sendBtn");
@@ -139,7 +136,6 @@ async function stopCurrentSession() {
     responseViewer.value = "";
     insertBtn.disabled = true;
     await fetchSessionStatus();
-    await fetchSavedSessions();
   } catch (err) {
     setStatus(`Error: ${err.message}`, "status-err");
   }
@@ -262,87 +258,6 @@ insertBtn.addEventListener("click", async () => {
   }
 });
 
-// ── Saved sessions ───────────────────────────────────────────────────────
-
-async function fetchSavedSessions() {
-  try {
-    const r = await fetch(`${BRIDGE}/sessions`);
-    const data = await r.json();
-    renderSavedSessions(data.sessions || []);
-  } catch (err) {
-    debug(`fetchSavedSessions: ${err.message}`);
-  }
-}
-
-function renderSavedSessions(sessions) {
-  if (!sessions.length) {
-    savedSessionList.innerHTML =
-      '<div style="color:#585b70;text-align:center;padding:10px;font-size:11px;">No saved sessions</div>';
-    return;
-  }
-  savedSessionList.innerHTML = sessions
-    .slice(0, 20)
-    .map((s) => {
-      const title = s.title || s.session_id;
-      const updated = s.updated || "?";
-      return `<div class="session-list-item">
-        <div>
-          <div class="sli-id" title="${s.session_id}">${title}</div>
-          <div class="sli-meta">${s.session_id} · ${updated}</div>
-        </div>
-        <div class="sli-actions">
-          <button data-load="${s.session_id}">Load</button>
-          <button data-delete="${s.session_id}">Delete</button>
-        </div>
-      </div>`;
-    })
-    .join("");
-
-  savedSessionList.querySelectorAll("[data-load]").forEach((btn) => {
-    btn.addEventListener("click", () => loadSession(btn.dataset.load));
-  });
-  savedSessionList.querySelectorAll("[data-delete]").forEach((btn) => {
-    btn.addEventListener("click", () => deleteSession(btn.dataset.delete));
-  });
-}
-
-async function loadSession(sessionId) {
-  setStatus("Loading session…", "status-info");
-  debug(`Loading session: ${sessionId}`);
-  try {
-    const r = await fetch(`${BRIDGE}/sessions/load/${sessionId}`, { method: "POST" });
-    const data = await r.json();
-    if (data.success) {
-      setStatus("Session loaded", "status-ok");
-      responseViewer.value = "";
-      insertBtn.disabled = true;
-      await fetchSessionStatus();
-      await fetchSavedSessions();
-    } else {
-      setStatus(`Error: ${data.error}`, "status-err");
-    }
-  } catch (err) {
-    setStatus(`Error: ${err.message}`, "status-err");
-  }
-}
-
-async function deleteSession(sessionId) {
-  if (!confirm(`Delete session ${sessionId}?`)) return;
-  debug(`Deleting session: ${sessionId}`);
-  try {
-    const r = await fetch(`${BRIDGE}/sessions/${sessionId}`, { method: "DELETE" });
-    const data = await r.json();
-    if (data.success) {
-      setStatus("Session deleted", "status-ok");
-      await fetchSavedSessions();
-    } else {
-      setStatus(`Error: ${data.error}`, "status-err");
-    }
-  } catch (err) {
-    setStatus(`Error: ${err.message}`, "status-err");
-  }
-}
-
 // ── Workspace ────────────────────────────────────────────────────────────
 
 async function fetchWorkspace() {
@@ -416,7 +331,6 @@ openTerminalBtn.addEventListener("click", openTerminal);
 newSessionBtn.addEventListener("click", startNewSession);
 stopSessionBtn.addEventListener("click", async () => {
   await stopCurrentSession();
-  await fetchSavedSessions();
 });
 
 // ── Diagnostics ──────────────────────────────────────────────────────────
@@ -425,7 +339,6 @@ refreshBtn.addEventListener("click", async () => {
   debug("Refreshing…");
   await fetchWorkspace();
   await fetchSessionStatus();
-  await fetchSavedSessions();
   debug("Refreshed");
 });
 
@@ -477,14 +390,8 @@ chrome.storage.session.get(["pendingPrompt", "panelState"], (result) => {
 
   fetchWorkspace();
   fetchSessionStatus();
-  fetchSavedSessions();
 
-  statusPollInterval = setInterval(async () => {
-    const data = await fetchSessionStatus();
-    if (data && data.active) {
-      await fetchSavedSessions();
-    }
-  }, 5000);
+  statusPollInterval = setInterval(fetchSessionStatus, 5000);
 });
 
 window.addEventListener("unload", () => {

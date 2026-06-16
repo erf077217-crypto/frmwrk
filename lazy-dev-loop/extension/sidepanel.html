@@ -128,32 +128,6 @@
     .badge-active   { background: #a6e3a1; color: #1e1e2e; }
     .badge-inactive { background: #45475a; color: #a6adc8; }
 
-    /* ── Saved sessions list ── */
-    .session-list {
-      background: #313244;
-      border: 1px solid #45475a;
-      border-radius: 6px;
-      max-height: 140px;
-      overflow-y: auto;
-    }
-    .session-list-item {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      padding: 5px 8px;
-      border-bottom: 1px solid #313244;
-      font-size: 11px;
-    }
-    .session-list-item:last-child { border-bottom: none; }
-    .sli-id    { color: #cdd6f4; font-family: monospace; font-size: 11px; }
-    .sli-meta  { color: #6c7086; font-size: 10px; margin-top: 1px; }
-    .sli-actions { display: flex; gap: 4px; flex-shrink: 0; }
-    .sli-actions button {
-      flex: none; padding: 2px 7px; font-size: 9px; border-radius: 4px;
-      background: #45475a; color: #cdd6f4; border: none; cursor: pointer;
-    }
-    .sli-actions button:hover { background: #585b70; }
-
     /* ── Workspace ── */
     .workspace-display {
       background: #313244;
@@ -259,14 +233,6 @@
       <span class="badge badge-inactive" id="sessionStateBadge">Inactive</span>
       <span id="sessionIdDisplay">—</span>
       <span id="sessionUptimeDisplay"></span>
-    </div>
-  </section>
-
-  <!-- Saved Sessions -->
-  <section>
-    <h3>Saved Sessions</h3>
-    <div class="session-list" id="savedSessionList">
-      <div style="color:#585b70;text-align:center;padding:10px;font-size:11px;">No saved sessions</div>
     </div>
   </section>
 

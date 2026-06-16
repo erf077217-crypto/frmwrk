@@ -41,9 +41,14 @@ def _ensure_tmux() -> bool:
         return False
 
 
-def _capture_pane() -> str:
-    stdout, _, _ = _tmux(f"capture-pane -t {TMUX_SESSION_NAME} -p")
-    return stdout or ""
+def _capture_pane(scrollback: int = 0) -> str:
+    if scrollback > 0:
+        stdout, _, _ = _tmux(
+            f"capture-pane -t {TMUX_SESSION_NAME} -p -S -{scrollback}"
+        )
+    else:
+        stdout, _, _ = _tmux(f"capture-pane -t {TMUX_SESSION_NAME} -p")
+    return strip_ansi(stdout or "")
 
 
 def _wait_for_opencode_ready(timeout: int = 120) -> bool:
@@ -96,7 +101,7 @@ def _escape_single_quotes(text: str) -> str:
     return text.replace("'", "'\\''")
 
 
-def _capture_pane_with_scrollback(scrollback: int = 2000) -> str:
+def _capture_pane_with_scrollback(scrollback: int = 50000) -> str:
     stdout, _, _ = _tmux(
         f"capture-pane -t {TMUX_SESSION_NAME} -p -S -{scrollback}"
     )
@@ -109,36 +114,101 @@ def _extract_response(pane_content: str, sent_prompt: str) -> str:
     Strips ANSI, formatting, timing info, and echoed prompts,
     returning only the model's response text for the most recent prompt.
     """
+
+    def _collect(lines_iter, start_idx):
+        """Collect response lines starting at start_idx, stopping at ▣."""
+        collected = []
+        for line in lines_iter[start_idx:]:
+            s = line.strip()
+            if not s:
+                continue
+            if "▣" in s:
+                break
+            if any(s.startswith(c) for c in ("┃", "╹", "▀", "▄", "▌", "─", "│", "╻", "⠋", "⣽", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")):
+                continue
+            if s.startswith("+"):
+                continue
+            if s.startswith("→"):
+                continue
+            if s.startswith("~"):
+                continue
+            if s.startswith("⬝"):
+                continue
+            if "ctrl+p" in s or "Build" in s or "◉" in s:
+                continue
+            collected.append(s)
+        return collected
+
     lines = pane_content.split("\n")
-    result: list[str] = []
-    in_response = False
-    for line in lines:
+
+    # Primary method: find prompt echo even if wrapped across multiple ┃ lines
+    # Join consecutive ┃-prefixed lines to handle prompt wrapping
+    prompt_words = sent_prompt.split()
+    if prompt_words:
+        first_word = prompt_words[0]
+    else:
+        first_word = ""
+
+    match_start = -1
+    for i, line in enumerate(lines):
         s = line.strip()
-        if not s:
-            continue
-        # Locate the most recent echoed prompt line
+        # Check if this line starts a prompt echo block
+        if s.startswith("┃") and first_word and first_word in s:
+            # Collect consecutive ┃ lines and check if they form the full prompt
+            joined = []
+            j = i
+            while j < len(lines) and lines[j].strip().startswith("┃"):
+                joined.append(lines[j].strip().lstrip("┃").strip())
+                j += 1
+            if joined and sent_prompt in " ".join(joined):
+                match_start = i
+                break
+        # Fallback direct match (for single-line prompts)
         if sent_prompt in s:
-            in_response = True
-            result = []
-            continue
-        if not in_response:
-            continue
-        # Stop at the next prompt marker
-        if "▣" in s:
+            match_start = i
             break
-        # Skip formatting characters
-        if any(s.startswith(c) for c in ("┃", "╹", "▀", "▄", "▌", "─", "│", "╻")):
-            continue
-        # Skip timing lines
-        if s.startswith("+") and any(
-            w in s for w in ("Thought", "Duration", "Time")
-        ):
-            continue
-        # Skip status-bar artifacts
-        if "ctrl+p" in s or "Build" in s or "◉" in s:
-            continue
-        result.append(s)
-    return (" ".join(result)).strip() if result else ""
+
+    if match_start >= 0:
+        # Skip past the ┃-prefixed block (prompt echo may span multiple lines)
+        echo_end = match_start
+        while echo_end < len(lines) and lines[echo_end].strip().startswith("┃"):
+            echo_end += 1
+        result = _collect(lines, echo_end)
+        if result:
+            return (" ".join(result)).strip()
+
+    # Fallback: prompt echo scrolled out — use ▣ markers
+    # Collect content BEFORE the last ▣ (which follows the response)
+    marker_idxs = [i for i, line in enumerate(lines) if "▣" in line]
+    if len(marker_idxs) >= 2:
+        # Content between second-to-last ▣ and last ▣ (or end)
+        start = marker_idxs[-2] + 1
+        result = _collect(lines, start)
+        if result and _looks_like_prompt_echo(result[0]):
+            result = result[1:]
+        if result:
+            return (" ".join(result)).strip()
+    elif marker_idxs:
+        # Collect content BEFORE the last ▣ (not after)
+        # The response is between the prompt echo and the final ▣
+        start = 0
+        end = marker_idxs[-1]
+        result = _collect(lines[:end], start)
+        if result:
+            return (" ".join(result)).strip()
+
+    return ""
+
+
+def _looks_like_prompt_echo(line: str) -> bool:
+    """Heuristic: a line that is a plain alphanumeric statement (not code/formatted)."""
+    # A prompt echo is typically an unformatted text line
+    # that doesn't start with formatting chars and is short enough to be user input
+    if any(c in line for c in ("```", "{|", "|}", "---", "===")):
+        return False
+    if len(line) > 500:
+        return False
+    return True
 
 
 def _opencode_cmd() -> str:
@@ -153,7 +223,7 @@ def _opencode_cmd() -> str:
     return cmd
 
 
-def _create_session(timeout: int = 120) -> str | None:
+def _create_session(timeout: int = 120, cwd: str | None = None) -> str | None:
     opencode = _opencode_cmd()
     inner = (
         f"{opencode} run --format json "
@@ -167,6 +237,7 @@ def _create_session(timeout: int = 120) -> str | None:
             inner,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            cwd=cwd,
         )
         while True:
             remaining = deadline - time.monotonic()
@@ -205,33 +276,6 @@ def _create_session(timeout: int = 120) -> str | None:
                 proc.kill()
             except OSError:
                 pass
-
-
-def _list_session_ids() -> set[str]:
-    stdout, _, _ = _opencode_cli("session", "list")
-    if not stdout:
-        return set()
-    return set(re.findall(r'ses_[a-zA-Z0-9]+', stdout))
-
-
-def _session_list() -> list[dict]:
-    stdout, _, rc = _opencode_cli("session", "list", "--json")
-    if rc != 0 or not stdout:
-        return []
-    try:
-        data = json.loads(stdout)
-    except json.JSONDecodeError:
-        return []
-    sessions = data if isinstance(data, list) else data.get("sessions", data.get("data", []))
-    out = []
-    for s in sessions:
-        out.append({
-            "session_id": s.get("id") or s.get("session_id", ""),
-            "title": s.get("title", "") or "",
-            "updated": s.get("updatedAt") or s.get("updated", "") or "",
-            "source": "opencode",
-        })
-    return out
 
 
 def _normalize_messages(raw_messages: list) -> list[dict]:
@@ -316,6 +360,7 @@ class TmuxSession:
                 "error": "No workspace set. Set a workspace first.",
             }
 
+        _tmux("set -g history-limit 50000 2>/dev/null")
         _tmux(f"kill-session -t {TMUX_SESSION_NAME} 2>/dev/null")
         time.sleep(0.5)
 
@@ -329,7 +374,7 @@ class TmuxSession:
                         f"succeeds in the execution environment."
                     ),
                 }
-            session_id = _create_session()
+            session_id = _create_session(cwd=wsl_path)
             if not session_id:
                 return {
                     "success": False,
@@ -339,10 +384,8 @@ class TmuxSession:
                     ),
                 }
 
-        flag = f"--session {shlex.quote(session_id)}"
         opencode_cmd = (
-            f"cd {shlex.quote(wsl_path)} && "
-            f"{_opencode_cmd()} {flag}".strip()
+            f"{_opencode_cmd()} --session {shlex.quote(session_id)} {shlex.quote(wsl_path)}"
         )
         create_out = _tmux(
             f"new-session -d -s {TMUX_SESSION_NAME} {shlex.quote(opencode_cmd)}"
@@ -465,27 +508,6 @@ def open_terminal() -> dict:
     return _active.open_terminal()
 
 
-def list_sessions() -> list[dict]:
-    return _session_list()
-
-
-def get_session(session_id: str) -> dict | None:
-    return _session_export(session_id)
-
-
-async def load_session(session_id: str) -> dict:
-    if _active.active:
-        _active.stop()
-    return _active.start(session_id=session_id)
-
-
-def delete_session(session_id: str) -> dict:
-    stdout, stderr, rc = _opencode_cli("session", "delete", session_id)
-    if rc != 0:
-        return {"success": False, "error": stderr or "Delete failed"}
-    return {"success": True, "deleted": session_id}
-
-
 # ── background prompt processing (via tmux send-keys + capture-pane) --------
 
 _prompt_state: dict = {}
@@ -517,15 +539,7 @@ def start_prompt_background(prompt: str, mode: str = "summary") -> str:
         try:
             _dbg(f"tmux prompt: send-keys -t {TMUX_SESSION_NAME} '{prompt}'")
 
-            # 0. Wait for opencode to be ready for input
-            if not _wait_for_opencode_ready(timeout=30):
-                with _prompt_lock:
-                    _prompt_state["error"] = "opencode not ready for input after 30s"
-                    _prompt_state["running"] = False
-                    _prompt_state["done"] = True
-                return
-
-            # 2. Send prompt into the running opencode TUI
+            # 1. Send prompt into the running opencode TUI
             escaped = _escape_single_quotes(prompt)
             _, stderr, rc = _tmux(
                 f"send-keys -t {TMUX_SESSION_NAME} '{escaped}' Enter"
@@ -537,7 +551,7 @@ def start_prompt_background(prompt: str, mode: str = "summary") -> str:
                     _prompt_state["done"] = True
                 return
 
-            # 3. Poll capture-pane until the extracted response stabilizes.
+            # 2. Poll capture-pane until the extracted response stabilizes.
             #    Compare extracted response text (immune to terminal client noise)
             #    instead of raw pane content.  Require at least one non-empty
             #    extracted response before declaring stability.
@@ -545,35 +559,74 @@ def start_prompt_background(prompt: str, mode: str = "summary") -> str:
             last_extracted = ""
             stable_since: float | None = None
             changed = False
+            saw_prompt_char = False
             poll_count = 0
             poll_t0 = time.monotonic()
 
             while time.time() < deadline:
                 time.sleep(0.25)
                 poll_count += 1
-                current = _capture_pane_with_scrollback(2000)
+                current = _capture_pane_with_scrollback()
                 extracted = _extract_response(current, prompt)
+
+                # Track whether ▣ prompt character has reappeared (signals completion)
+                if "▣" in current:
+                    saw_prompt_char = True
+
+                # Only consider non-trivial extracted text as meaningful content
+                is_meaningful = len(extracted) >= 20
+
                 if extracted == last_extracted:
-                    if changed and stable_since is None:
+                    # Stability detected: content unchanged between polls
+                    if not changed:
+                        # Still waiting for first meaningful content
+                        pass
+                    elif stable_since is None:
                         stable_since = time.time()
                         _dbg(f"_run: stable start (poll={poll_count}, elapsed={time.monotonic()-poll_t0:.1f}s, extracted={extracted[:60]!r})")
-                    elif changed and time.time() - stable_since >= 1.5:
-                        _dbg(f"_run: stability achieved (poll={poll_count}, elapsed={time.monotonic()-poll_t0:.1f}s)")
-                        break
+                    elif time.time() - stable_since >= 1.5:
+                        # Only complete if we have meaningful content OR ▣ reappeared
+                        if is_meaningful or saw_prompt_char:
+                            _dbg(f"_run: stability achieved (poll={poll_count}, elapsed={time.monotonic()-poll_t0:.1f}s)")
+                            break
                 else:
                     last_extracted = extracted
-                    changed = True
                     stable_since = None
-                    # Update streaming progress
+                    # Only mark as changed if content is meaningful
+                    if len(extracted) >= 20:
+                        changed = True
+                    # Update streaming progress even for partial content
                     if extracted:
                         with _prompt_lock:
                             _prompt_state["progress"] = extracted
                     if poll_count % 4 == 0:
                         _dbg(f"_run: content changed (poll={poll_count}, elapsed={time.monotonic()-poll_t0:.1f}s, extracted={extracted[:50]!r})")
 
-            # 4. Final result
+            # 3. Final result — use opencode export for ground truth
             elapsed = time.monotonic() - poll_t0
             result = last_extracted
+
+            # After completion, export the session for the definitive full response.
+            # Pane extraction during generation only sees the visible 25-line window
+            # (opencode is a full-screen TUI; tmux scrollback is empty), so the
+            # extracted result may be only the last visible fragment.  The export
+            # gives the complete assistant reply from opencode's internal data.
+            sid = _current_session_id
+            if sid:
+                _dbg(f"_run: fetching export for session {sid}")
+                exported = _session_export(sid)
+                if exported:
+                    msgs = exported.get("messages", [])
+                    for m in reversed(msgs):
+                        if m.get("role") == "assistant" and m.get("content", "").strip():
+                            reply = m["content"].strip()
+                            if len(reply) >= len(result):
+                                result = reply
+                                _dbg(f"_run: export reply (len={len(result)}) replaces pane extraction (len={len(last_extracted)})")
+                            else:
+                                _dbg(f"_run: keeping pane extraction (len={len(result)}) > export reply (len={len(reply)})")
+                            break
+
             _dbg(f"_run: done (elapsed={elapsed:.1f}s, polls={poll_count}, result_len={len(result)}, result={result[:80]!r})")
 
             with _prompt_lock:

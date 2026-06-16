@@ -1,6 +1,5 @@
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 import opencode_runner
@@ -121,34 +120,6 @@ async def session_status():
 async def session_preview(lines: int = Query(5, ge=1, le=50)):
     from tmux_session import get_active
     return {"preview": get_active().pane_preview(max_lines=lines)}
-
-
-# ---------------------------------------------------------------------------
-# Session history  —  sourced from OpenCode CLI
-# ---------------------------------------------------------------------------
-
-
-@app.get("/sessions")
-async def list_sessions():
-    return {"sessions": ocs.list_sessions()}
-
-
-@app.get("/sessions/{session_id}")
-async def get_session(session_id: str):
-    data = ocs.get_session(session_id)
-    if not data:
-        return JSONResponse({"error": "session_not_found"}, status_code=404)
-    return data
-
-
-@app.post("/sessions/load/{session_id}")
-async def load_session(session_id: str):
-    return await ocs.load_session(session_id)
-
-
-@app.delete("/sessions/{session_id}")
-async def delete_session(session_id: str):
-    return ocs.delete_session(session_id)
 
 
 # ---------------------------------------------------------------------------
