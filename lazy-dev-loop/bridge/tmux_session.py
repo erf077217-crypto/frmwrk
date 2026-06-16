@@ -71,7 +71,7 @@ def _wait_for_opencode_ready(timeout: int = 120) -> bool:
     deadline = time.monotonic() + timeout
     t0 = time.monotonic()
     while time.monotonic() < deadline:
-        content = _capture_pane_with_scrollback(200)
+        content = _capture_pane_full_history()
         if "▣" in content:
             elapsed = time.monotonic() - t0
             _dbg(f"_wait_for_opencode_ready: ready after {elapsed:.1f}s")
@@ -116,114 +116,117 @@ def _escape_single_quotes(text: str) -> str:
     return text.replace("'", "'\\''")
 
 
-def _capture_pane_with_scrollback(scrollback: int = 50000) -> str:
+def _capture_pane_full_history() -> str:
+    """Capture the ENTIRE pane history from absolute line 0.
+
+    Uses tmux -S - which is scroll-position independent.
+    Unlike -S -50000 (relative to visible screen bottom),
+    this always returns the same content regardless of scroll position
+    in the attached terminal.
+    """
     stdout, _, _ = _tmux(
-        f"capture-pane -t {TMUX_SESSION_NAME} -p -S -{scrollback}"
+        f"capture-pane -t {TMUX_SESSION_NAME} -p -S -"
     )
     return strip_ansi(stdout or "")
 
 
-def _extract_response(pane_content: str, sent_prompt: str) -> str:
-    """Extract latest opencode response text from tmux pane capture.
+def _capture_pane_visible() -> str:
+    """Capture only the VISIBLE portion of the pane (last ~N lines).
 
-    Strips ANSI, formatting, timing info, and echoed prompts,
-    returning only the model's response text for the most recent prompt.
+    Used for idle/busy detection where we only need the bottom
+    of the terminal, not the full history.
     """
+    return _capture_pane(scrollback=0)
 
-    def _collect(lines_iter, start_idx):
-        """Collect response lines starting at start_idx, stopping at ▣."""
-        collected = []
-        for line in lines_iter[start_idx:]:
-            s = line.strip()
-            if not s:
-                continue
-            if "▣" in s:
-                break
-            if any(s.startswith(c) for c in ("┃", "╹", "▀", "▄", "▌", "─", "│", "╻", "⠋", "⣽", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")):
-                continue
-            if s.startswith("+"):
-                continue
-            if s.startswith("→"):
-                continue
-            if s.startswith("~"):
-                continue
-            if s.startswith("⬝"):
-                continue
-            if "ctrl+p" in s or "Build" in s or "◉" in s:
-                continue
-            collected.append(s)
-        return collected
 
-    lines = pane_content.split("\n")
+# Characters that are part of the OpenCode TUI chrome, not the response text.
+_FORMAT_CHARS = frozenset((
+    "┃", "╹", "▀", "▄", "▌", "─", "│", "╻",
+    "⠋", "⣽", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
+))
 
-    # Primary method: find prompt echo even if wrapped across multiple ┃ lines
-    # Join consecutive ┃-prefixed lines to handle prompt wrapping
+
+def _is_format_line(s: str) -> bool:
+    """Return True if *s* is a TUI chrome/status line, not response content."""
+    if not s:
+        return True
+    if any(s.startswith(c) for c in _FORMAT_CHARS):
+        return True
+    if s.startswith(("+", "→", "~", "⬝")):
+        return True
+    if "ctrl+p" in s or "Build" in s or "◉" in s:
+        return True
+    return False
+
+
+def _extract_response(raw_buffer: str, sent_prompt: str) -> str:
+    """Extract opencode response text from the append-only prompt buffer.
+
+    *raw_buffer* is a per-prompt accumulation that contains only content
+    AFTER the baseline capture (i.e. the prompt echo + response text).
+    It NEVER contains pre-prompt scrollback history.
+
+    Strips ANSI (already done at capture time), formatting, status lines,
+    and echoed prompts — returning only clean response text.
+    """
+    lines = raw_buffer.split("\n")
+
+    # ── 1. Find the prompt echo ────────────────────────────────────────
     prompt_words = sent_prompt.split()
-    if prompt_words:
-        first_word = prompt_words[0]
-    else:
-        first_word = ""
+    first_word = prompt_words[0] if prompt_words else ""
 
     match_start = -1
     for i, line in enumerate(lines):
         s = line.strip()
-        # Check if this line starts a prompt echo block
-        if s.startswith("┃") and first_word and first_word in s:
-            # Collect consecutive ┃ lines and check if they form the full prompt
+        if "┃" in s and first_word and first_word in s:
             joined = []
             j = i
-            while j < len(lines) and lines[j].strip().startswith("┃"):
+            while j < len(lines) and "┃" in lines[j]:
                 joined.append(lines[j].strip().lstrip("┃").strip())
                 j += 1
             if joined and sent_prompt in " ".join(joined):
                 match_start = i
                 break
-        # Fallback direct match (for single-line prompts)
         if sent_prompt in s:
             match_start = i
             break
 
-    if match_start >= 0:
-        # Skip past the ┃-prefixed block (prompt echo may span multiple lines)
-        echo_end = match_start
-        while echo_end < len(lines) and lines[echo_end].strip().startswith("┃"):
-            echo_end += 1
-        result = _collect(lines, echo_end)
-        if result:
-            return (" ".join(result)).strip()
+    if match_start < 0:
+        # Fallback: echo may have been lost due to buffer trimming.
+        # Return all non-format content from the buffer.
+        collected: list[str] = []
+        for line in lines:
+            s = line.strip()
+            if not s:
+                continue
+            if "▣" in s:
+                continue
+            if _is_format_line(s):
+                continue
+            collected.append(s)
+        return (" ".join(collected)).strip() if collected else ""
 
-    # Fallback: prompt echo scrolled out — use ▣ markers
-    # Collect content BEFORE the last ▣ (which follows the response)
-    marker_idxs = [i for i, line in enumerate(lines) if "▣" in line]
-    if len(marker_idxs) >= 2:
-        # Content between second-to-last ▣ and last ▣ (or end)
-        start = marker_idxs[-2] + 1
-        result = _collect(lines, start)
-        if result and _looks_like_prompt_echo(result[0]):
-            result = result[1:]
-        if result:
-            return (" ".join(result)).strip()
-    elif marker_idxs:
-        # Collect content BEFORE the last ▣ (not after)
-        # The response is between the prompt echo and the final ▣
-        start = 0
-        end = marker_idxs[-1]
-        result = _collect(lines[:end], start)
-        if result:
-            return (" ".join(result)).strip()
+    # ── 2. Skip past the ┃-wrapped echo block ──────────────────────────
+    echo_end = match_start
+    while echo_end < len(lines) and "┃" in lines[echo_end]:
+        echo_end += 1
 
-    return ""
+    # ── 3. Collect EVERYTHING from echo_end to end-of-buffer ───────────
+    #     Filter out TUI chrome; do NOT stop at ▣ because:
+    #     - the response may contain intermediate ▣ markers
+    #     - we want all content up to the most recent capture
+    collected: list[str] = []
+    for line in lines[echo_end:]:
+        s = line.strip()
+        if not s:
+            continue
+        if "▣" in s:
+            continue
+        if _is_format_line(s):
+            continue
+        collected.append(s)
 
-
-def _looks_like_prompt_echo(line: str) -> bool:
-    """Heuristic: a line that is a plain alphanumeric statement (not code/formatted)."""
-    # A prompt echo is typically an unformatted text line
-    # that doesn't start with formatting chars and is short enough to be user input
-    if any(c in line for c in ("```", "{|", "|}", "---", "===")):
-        return False
-    if len(line) > 500:
-        return False
-    return True
+    return (" ".join(collected)).strip()
 
 
 def _opencode_cmd() -> str:
@@ -560,12 +563,16 @@ def _recover_env():
 
 
 def _reset_prompt_state():
-    """Safely clear any in-flight prompt state."""
-    global _prompt_state
-    with _prompt_lock:
-        if _prompt_state.get("running"):
-            _dbg(f"SESSION RECOVERY: clearing in-flight prompt {_prompt_state.get('prompt_id')}")
-        _prompt_state = {}
+    """Safely clear ALL in-flight prompt states."""
+    with _prompt_states_lock:
+        for pid, state in list(_prompt_states.items()):
+            if state.get("running"):
+                _dbg(f"SESSION RECOVERY: clearing in-flight prompt {pid}")
+            state["cancelled"] = True
+            state["running"] = False
+            state["done"] = True
+            state["completion_reason"] = "session-reset"
+        _prompt_states.clear()
 
 
 # ── Verified shutdown (stops and verifies cleanup) ─────────────────────────
@@ -835,12 +842,41 @@ def open_terminal() -> dict:
 
 # ── background prompt processing (via tmux send-keys + capture-pane) --------
 
-_prompt_state: dict = {}
-_prompt_lock = threading.Lock()
+# Dict-of-dicts keyed by prompt_id — each prompt thread owns its own slot.
+# Never replaced wholesale; only individual entries are added/removed.
+_prompt_states: dict[str, dict] = {}
+_prompt_states_lock = threading.Lock()
+
+_MAX_RAW_BUFFER = 500 * 1024  # 500 KB cap for _raw_buffer per prompt
+
+# Confirmation period: idle prompt must be stable for this long before completing
+_IDLE_CONFIRM_SECONDS = 2.0
+
+# Safety timeout: if a prompt runs longer than this, force-complete it
+_MAX_PROMPT_DURATION = 30 * 60  # 30 minutes
+
+
+def _cancel_other_prompts(new_prompt_id: str) -> None:
+    """Mark all running prompts except *new_prompt_id* as cancelled."""
+    with _prompt_states_lock:
+        for pid, state in list(_prompt_states.items()):
+            if pid != new_prompt_id and state.get("running") and not state.get("done"):
+                state["cancelled"] = True
+                _dbg(f"PROMPT[{pid}] cancelled by PROMPT[{new_prompt_id}]")
+
+
+def _cleanup_stale_states() -> None:
+    """Remove completed/cancelled states older than 5 minutes."""
+    now = time.monotonic()
+    with _prompt_states_lock:
+        for pid, state in list(_prompt_states.items()):
+            ts = state.get("_completed_at")
+            if ts and (now - ts) > 300:
+                del _prompt_states[pid]
 
 
 def start_prompt_background(prompt: str, mode: str = "summary") -> str:
-    global _prompt_state
+    _cleanup_stale_states()
     prompt_id = uuid.uuid4().hex[:8]
     _dbg(f"PROMPT[{prompt_id}] created mode={mode} prompt={prompt[:60]!r}")
 
@@ -848,27 +884,52 @@ def start_prompt_background(prompt: str, mode: str = "summary") -> str:
     has_sess_ok = _tmux(f"has-session -t {TMUX_SESSION_NAME}")[2] == 0
     _dbg(f"PROMPT[{prompt_id}] has-session: {has_sess_ok} ({time.monotonic()-has_sess_t0:.3f}s)")
     if not has_sess_ok:
-        with _prompt_lock:
-            _prompt_state = {
-                "prompt_id": prompt_id,
-                "running": False,
-                "done": True,
-                "result": None,
-                "error": "No active tmux session. Start a session first.",
-                "mode": mode,
-            }
+        state = {
+            "prompt_id": prompt_id,
+            "running": False,
+            "done": True,
+            "result": None,
+            "error": "No active tmux session. Start a session first.",
+            "mode": mode,
+        }
+        with _prompt_states_lock:
+            _prompt_states[prompt_id] = state
         return prompt_id
+
+    # Cancel any other running prompt — each prompt owns its own thread
+    _cancel_other_prompts(prompt_id)
+
+    state: dict = {
+        "prompt_id": prompt_id,
+        "running": True,
+        "done": False,
+        "live_buffer": "",
+        "final_result": None,
+        "progress": "",
+        "result": None,
+        "error": None,
+        "mode": mode,
+        "cancelled": False,
+        "_completed_at": None,
+    }
+    with _prompt_states_lock:
+        _prompt_states[prompt_id] = state
 
     def _is_session_alive() -> bool:
         return _tmux(f"has-session -t {TMUX_SESSION_NAME}")[2] == 0
 
     def _run():
-        global _prompt_state
         completion_reason = None
         try:
             _dbg(f"PROMPT[{prompt_id}] queued")
 
-            # 1. Send prompt into the running opencode TUI
+            # ── 1. Baseline capture BEFORE sending prompt ─────────────
+            # This ensures _raw_buffer starts empty and only accumulates
+            # content that appears AFTER the prompt is sent.
+            baseline = _capture_pane_full_history()
+            _last_raw_capture = baseline
+
+            # ── 2. Send prompt into the running opencode TUI ──────────
             send_t0 = time.monotonic()
             escaped = _escape_single_quotes(prompt)
             _, stderr, rc = _tmux(
@@ -879,14 +940,13 @@ def start_prompt_background(prompt: str, mode: str = "summary") -> str:
             if rc != 0:
                 completion_reason = "send-keys-failed"
                 _dbg(f"PROMPT[{prompt_id}] send-keys-failed stderr={stderr!r}")
-                with _prompt_lock:
-                    _prompt_state["error"] = stderr or "tmux send-keys failed"
-                    _prompt_state["running"] = False
-                    _prompt_state["done"] = True
+                state["error"] = stderr or "tmux send-keys failed"
+                state["running"] = False
+                state["done"] = True
+                state["_completed_at"] = time.monotonic()
                 return
 
-            # 2. Poll capture-pane with state machine.
-            #    NO WALL-CLOCK TIMEOUT. Completion requires idle state.
+            # ── 3. Poll capture-pane with state machine ───────────────
             _STATE_WAITING = "WAITING_FOR_FIRST_OUTPUT"
             _STATE_GENERATING = "GENERATING"
             _STATE_BUSY = "BUSY_NO_VISIBLE_OUTPUT"
@@ -894,146 +954,158 @@ def start_prompt_background(prompt: str, mode: str = "summary") -> str:
 
             last_extracted = ""
             live_buffer = ""
-            _last_raw_capture = ""
             _raw_buffer = ""
             session_alive = True
             poll_count = 0
             poll_t0 = time.monotonic()
             last_progress_report = 0.0
-            state = _STATE_WAITING
+            processing_state = _STATE_WAITING
             completing_since: float | None = None
-            confirm_period = 2.0
 
             while True:
                 time.sleep(0.25)
                 poll_count += 1
 
-                # Check session health every 20 polls (~5s)
+                # ── Cancellation check ───────────────────────────────
+                if state.get("cancelled"):
+                    completion_reason = "cancelled"
+                    _dbg(f"PROMPT[{prompt_id}] cancelled externally")
+                    break
+
+                # ── Safety timeout ───────────────────────────────────
+                elapsed_total = time.monotonic() - poll_t0
+                if elapsed_total > _MAX_PROMPT_DURATION:
+                    completion_reason = "timeout"
+                    _dbg(f"PROMPT[{prompt_id}] safety timeout after {elapsed_total:.0f}s")
+                    break
+
+                # ── Session health check (every 20 polls ≈ 5s) ───────
                 if poll_count % 20 == 0:
                     if not _is_session_alive():
                         completion_reason = "session-died"
                         session_alive = False
-                        _dbg(f"PROMPT[{prompt_id}] session-died (poll={poll_count} elapsed={time.monotonic()-poll_t0:.1f}s)")
+                        _dbg(f"PROMPT[{prompt_id}] session-died (poll={poll_count})")
                         break
 
+                # ── Capture content (SCROLL-INDEPENDENT) ──────────────
                 cap_t0 = time.monotonic()
-                current = _capture_pane_with_scrollback()
+                current = _capture_pane_full_history()
                 cap_elapsed = time.monotonic() - cap_t0
                 capture_size = len(current)
-                last_line = (current.strip().split("\n") or [""])[-1][:120]
 
                 # ── Append-only buffer accumulation ───────────────────
-                # Accumulate raw pane content; never replace the buffer.
+                # new_raw is the content that appeared in the pane since
+                # the last poll.  With -S -, captures always start from
+                # the beginning of history, so _diff_captures correctly
+                # identifies new content via monotonic prefix growth.
                 new_raw = _diff_captures(_last_raw_capture, current)
                 if new_raw:
                     _raw_buffer += new_raw
+                    # Bounded buffer: if _raw_buffer exceeds 2× the limit,
+                    # discard content from the MIDDLE, keeping head+tail.
+                    # The head contains the prompt echo needed for extraction;
+                    # the tail has the most recent response content.
+                    if len(_raw_buffer) > _MAX_RAW_BUFFER * 2:
+                        head = _raw_buffer[:_MAX_RAW_BUFFER // 2]
+                        tail = _raw_buffer[-(_MAX_RAW_BUFFER // 2):]
+                        _raw_buffer = head + "\n... [TRUNCATED] ...\n" + tail
+                        _dbg(f"PROMPT[{prompt_id}] trimmed _raw_buffer to {len(_raw_buffer)} bytes")
                 _last_raw_capture = current
 
-                # Extract response from the stable accumulated buffer,
-                # NOT from the live tmux capture.
+                # ── Extract response from stable buffer ───────────────
                 extracted = _extract_response(_raw_buffer, prompt)
                 extracted_len = len(extracted)
 
-                # Detect signals (current capture still used for
-                # idle/busy detection since those look at terminal state)
-                has_idle_prompt = _has_idle_prompt(current)
-                is_busy = _has_busy_indicators(current)
+                # ── Idle/busy detection (last 30 lines ≈ visible pane) ─
+                # Use a suffix of the full-history capture rather than
+                # a separate capture-pane call (avoids I/O overhead).
+                visible = "\n".join(current.split("\n")[-30:])
+                has_idle_prompt = _has_idle_prompt(visible)
+                is_busy = _has_busy_indicators(visible)
                 text_changed = extracted != last_extracted
                 is_meaningful = extracted_len >= 20
 
-                _dbg(f"PROMPT[{prompt_id}] state={state} capture size={capture_size} last={last_line!r} extracted={extracted_len} new={extracted_len - len(last_extracted)} idle_prompt={has_idle_prompt} busy={is_busy} cap_took={cap_elapsed*1000:.0f}ms _raw_buffer_len={len(_raw_buffer)}")
+                _dbg(
+                    f"PROMPT[{prompt_id}] state={processing_state} "
+                    f"capture_size={capture_size} "
+                    f"extracted={extracted_len} "
+                    f"new={extracted_len - len(last_extracted)} "
+                    f"idle_prompt={has_idle_prompt} "
+                    f"busy={is_busy} "
+                    f"cap_took={cap_elapsed*1000:.0f}ms "
+                    f"_raw_buffer_len={len(_raw_buffer)}"
+                )
 
-                if is_busy:
-                    _dbg(f"PROMPT[{prompt_id}] busy_indicator_detected=True")
-                if has_idle_prompt:
-                    _dbg(f"PROMPT[{prompt_id}] idle_prompt_detected=True")
-
-                # ── Append-only prompt buffer update ──────────────────
-                # Because _raw_buffer only grows and _extract_response is
-                # a pure function, the extracted text can only grow (or
-                # stay the same).  We never replace the buffer.
-                if text_changed:
-                    if len(extracted) > len(last_extracted):
-                        delta = extracted[len(last_extracted):]
-                        live_buffer = extracted
-                        if delta:
-                            with _prompt_lock:
-                                _prompt_state["live_buffer"] = live_buffer
-                                _prompt_state["progress"] = live_buffer
+                # ── Update live buffer ───────────────────────────────
+                if text_changed and len(extracted) > len(last_extracted):
+                    live_buffer = extracted
+                    state["live_buffer"] = live_buffer
+                    state["progress"] = live_buffer
                     last_extracted = extracted
 
-                if state == _STATE_WAITING:
+                # ── State machine ─────────────────────────────────────
+                if processing_state == _STATE_WAITING:
                     if is_meaningful:
-                        state = _STATE_GENERATING
-                        _dbg(f"PROMPT[{prompt_id}] state_transition: WAITING -> GENERATING")
+                        processing_state = _STATE_GENERATING
+                        _dbg(f"PROMPT[{prompt_id}] transition: WAITING -> GENERATING")
                     elif has_idle_prompt and not is_busy:
-                        state = _STATE_COMPLETING
+                        processing_state = _STATE_COMPLETING
                         completing_since = time.monotonic()
-                        _dbg(f"PROMPT[{prompt_id}] state_transition: WAITING -> COMPLETING")
-                        _dbg(f"PROMPT[{prompt_id}] completion_confirmed_reason=idle_prompt")
+                        _dbg(f"PROMPT[{prompt_id}] transition: WAITING -> COMPLETING")
 
-                elif state == _STATE_GENERATING:
+                elif processing_state == _STATE_GENERATING:
                     if text_changed:
-                        elapsed = time.monotonic() - poll_t0
-                        if elapsed - last_progress_report >= 30.0:
-                            last_progress_report = elapsed
-                            _dbg(f"PROMPT[{prompt_id}] progress (poll={poll_count}, elapsed={elapsed:.1f}s, extracted_len={extracted_len})")
-                    elif has_idle_prompt and not is_busy:
-                        state = _STATE_COMPLETING
+                        if elapsed_total - last_progress_report >= 30.0:
+                            last_progress_report = elapsed_total
+                            _dbg(f"PROMPT[{prompt_id}] progress (poll={poll_count}, elapsed={elapsed_total:.1f}s, extracted_len={extracted_len})")
+                    if has_idle_prompt and not is_busy:
+                        processing_state = _STATE_COMPLETING
                         completing_since = time.monotonic()
-                        _dbg(f"PROMPT[{prompt_id}] state_transition: GENERATING -> COMPLETING")
-                        _dbg(f"PROMPT[{prompt_id}] completion_confirmed_reason=idle_prompt")
+                        _dbg(f"PROMPT[{prompt_id}] transition: GENERATING -> COMPLETING")
                     elif is_busy:
-                        state = _STATE_BUSY
-                        _dbg(f"PROMPT[{prompt_id}] state_transition: GENERATING -> BUSY_NO_VISIBLE_OUTPUT")
-                        _dbg(f"PROMPT[{prompt_id}] completion_blocked_reason=busy_indicator")
+                        processing_state = _STATE_BUSY
+                        _dbg(f"PROMPT[{prompt_id}] transition: GENERATING -> BUSY")
 
-                elif state == _STATE_BUSY:
+                elif processing_state == _STATE_BUSY:
                     if text_changed:
-                        state = _STATE_GENERATING
-                        _dbg(f"PROMPT[{prompt_id}] state_transition: BUSY_NO_VISIBLE_OUTPUT -> GENERATING")
+                        processing_state = _STATE_GENERATING
+                        _dbg(f"PROMPT[{prompt_id}] transition: BUSY -> GENERATING")
                     elif has_idle_prompt and not is_busy:
-                        state = _STATE_COMPLETING
+                        processing_state = _STATE_COMPLETING
                         completing_since = time.monotonic()
-                        _dbg(f"PROMPT[{prompt_id}] state_transition: BUSY_NO_VISIBLE_OUTPUT -> COMPLETING")
-                        _dbg(f"PROMPT[{prompt_id}] completion_confirmed_reason=idle_prompt")
+                        _dbg(f"PROMPT[{prompt_id}] transition: BUSY -> COMPLETING")
 
-                elif state == _STATE_COMPLETING:
+                elif processing_state == _STATE_COMPLETING:
                     if text_changed:
-                        state = _STATE_GENERATING
+                        processing_state = _STATE_GENERATING
                         completing_since = None
-                        _dbg(f"PROMPT[{prompt_id}] state_transition: COMPLETING -> GENERATING (text resumed)")
+                        _dbg(f"PROMPT[{prompt_id}] transition: COMPLETING -> GENERATING (text resumed)")
                     elif is_busy:
-                        state = _STATE_BUSY
+                        processing_state = _STATE_BUSY
                         completing_since = None
-                        _dbg(f"PROMPT[{prompt_id}] state_transition: COMPLETING -> BUSY_NO_VISIBLE_OUTPUT")
-                        _dbg(f"PROMPT[{prompt_id}] completion_blocked_reason=busy_indicator")
+                        _dbg(f"PROMPT[{prompt_id}] transition: COMPLETING -> BUSY")
                     elif not has_idle_prompt:
-                        state = _STATE_BUSY
+                        processing_state = _STATE_BUSY
                         completing_since = None
-                        _dbg(f"PROMPT[{prompt_id}] state_transition: COMPLETING -> BUSY_NO_VISIBLE_OUTPUT (idle lost)")
-                        _dbg(f"PROMPT[{prompt_id}] completion_blocked_reason=no_idle_prompt")
-                    elif completing_since is not None and (time.monotonic() - completing_since) >= confirm_period:
+                        _dbg(f"PROMPT[{prompt_id}] transition: COMPLETING -> BUSY (idle lost)")
+                    elif completing_since is not None and (time.monotonic() - completing_since) >= _IDLE_CONFIRM_SECONDS:
                         completion_reason = "idle-complete"
-                        _dbg(f"PROMPT[{prompt_id}] completion_reason={completion_reason} (idle_for={time.monotonic()-completing_since:.1f}s)")
+                        _dbg(f"PROMPT[{prompt_id}] completed (idle_for={time.monotonic()-completing_since:.1f}s)")
                         break
 
-            # 3. Final result — use opencode export for ground truth
-            elapsed = time.monotonic() - poll_t0
+            # ── 4. Final result — opencode export for ground truth ────
             export_success = False
             final_result = None
             sid = _current_session_id
 
-            # Only attempt export if session is alive — dead sessions won't export
             if sid and session_alive:
                 _dbg(f"PROMPT[{prompt_id}] export start session={sid}")
                 exported = _session_export(sid)
-                max_retries = 10
-                for retry in range(max_retries):
+                for retry in range(10):
                     if exported is not None:
                         export_success = True
                         break
-                    _dbg(f"PROMPT[{prompt_id}] export retry {retry + 1}/{max_retries} session={sid}")
+                    _dbg(f"PROMPT[{prompt_id}] export retry {retry + 1}/10 session={sid}")
                     time.sleep(2.0)
                     exported = _session_export(sid)
 
@@ -1042,59 +1114,56 @@ def start_prompt_background(prompt: str, mode: str = "summary") -> str:
                     for m in reversed(msgs):
                         if m.get("role") == "assistant" and m.get("content", "").strip():
                             final_result = m["content"].strip()
-                            _dbg(f"PROMPT[{prompt_id}] final_result=export reply (len={len(final_result)})")
+                            _dbg(f"PROMPT[{prompt_id}] final_result from export (len={len(final_result)})")
                             break
 
             if completion_reason is None:
                 completion_reason = "unknown"
 
-            _dbg(f"PROMPT[{prompt_id}] done elapsed={elapsed:.1f}s polls={poll_count} live_buffer_len={len(live_buffer)} final_result_len={len(final_result or '')} reason={completion_reason} export_ok={export_success}")
+            elapsed = time.monotonic() - poll_t0
+            _dbg(
+                f"PROMPT[{prompt_id}] done elapsed={elapsed:.1f}s "
+                f"polls={poll_count} "
+                f"live_buffer_len={len(live_buffer)} "
+                f"final_result_len={len(final_result or '')} "
+                f"reason={completion_reason} "
+                f"export_ok={export_success}"
+            )
 
-            with _prompt_lock:
-                _prompt_state["running"] = False
-                _prompt_state["done"] = True
-                _prompt_state["completion_reason"] = completion_reason
-                _prompt_state["export_success"] = export_success
-                _prompt_state["final_result"] = final_result
-                _prompt_state["result"] = final_result or live_buffer or None
-                _prompt_state.pop("progress", None)
+            now = time.monotonic()
+            state["running"] = False
+            state["done"] = True
+            state["completion_reason"] = completion_reason
+            state["export_success"] = export_success
+            state["final_result"] = final_result
+            state["result"] = final_result or live_buffer or None
+            state.pop("progress", None)
+            state["_completed_at"] = now
 
         except Exception as e:
             completion_reason = "exception"
             _dbg(f"PROMPT[{prompt_id}] exception: {e}")
-            with _prompt_lock:
-                _prompt_state["completion_reason"] = completion_reason
-                _prompt_state["error"] = str(e)
-                _prompt_state["running"] = False
-                _prompt_state["done"] = True
+            state["completion_reason"] = completion_reason
+            state["error"] = str(e)
+            state["running"] = False
+            state["done"] = True
+            state["_completed_at"] = time.monotonic()
 
-    with _prompt_lock:
-        _dbg(f"PROMPT[{prompt_id}] started")
-        _prompt_state = {
-            "prompt_id": prompt_id,
-            "running": True,
-            "done": False,
-            "live_buffer": "",
-            "final_result": None,
-            "progress": "",
-            "result": None,
-            "error": None,
-            "mode": mode,
-        }
-
+    _dbg(f"PROMPT[{prompt_id}] started")
     thread = threading.Thread(target=_run, daemon=True)
     thread.start()
     return prompt_id
 
 
 def get_prompt_status(prompt_id: str) -> dict:
-    with _prompt_lock:
-        if _prompt_state.get("prompt_id") != prompt_id:
-            _dbg(f"PROMPT[{prompt_id}] NOT FOUND, current={_prompt_state.get('prompt_id')}")
+    with _prompt_states_lock:
+        state = _prompt_states.get(prompt_id)
+        if state is None:
+            _dbg(f"PROMPT[{prompt_id}] NOT FOUND, active={list(_prompt_states.keys())}")
             return {"error": "prompt_id not found"}
-        state = dict(_prompt_state)
-        done = state.get('done')
-        running = state.get('running')
-        result_len = len(state.get('result', '') or '')
+        copied = dict(state)
+        done = copied.get("done")
+        running = copied.get("running")
+        result_len = len(copied.get("result", "") or "")
         _dbg(f"PROMPT[{prompt_id}] status done={done} running={running} result_len={result_len}")
-        return state
+        return copied
