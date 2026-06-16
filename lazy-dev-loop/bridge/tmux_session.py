@@ -324,10 +324,12 @@ def _find_opencode_processes() -> list[dict]:
     wraps commands in the appropriate shell.
     """
     results: list[dict] = []
-    stdout, _, rc = platform.run(
+    result = platform.run(
         "pgrep -af opencode 2>/dev/null || ps aux | grep -v grep | grep opencode",
         timeout=10,
     )
+    stdout = result.stdout
+    rc = result.returncode
     if rc == 0 and stdout:
         for line in stdout.strip().split("\n"):
             line = line.strip()
