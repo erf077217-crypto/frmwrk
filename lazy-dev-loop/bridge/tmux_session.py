@@ -272,6 +272,36 @@ def _has_idle_prompt(pane_content: str) -> bool:
     return False
 
 
+def _diff_captures(previous: str, current: str) -> str:
+    """Return the new content in *current* that was not in *previous*.
+
+    Handles both append-only growth and scrollback buffer overflow by
+    finding the maximum overlap (suffix of *previous* matching prefix of
+    *current*).  Iterates from longest possible overlap to shortest so
+    the first match is the best match.
+
+    When no overlap is found at all (complete content replacement),
+    returns *current* as a safe fallback.
+    """
+    if not previous:
+        return current
+    if not current:
+        return ""
+    # Fast path: previous is a prefix of current (append-only growth).
+    if current.startswith(previous):
+        return current[len(previous):]
+    # Scrollback overflow: find the LONGEST suffix of `previous` that is
+    # a prefix of `current`.  Check i=1..N so that the first match is
+    # the longest overlap.  Limit search to the last 10 kchars for
+    # performance (a 250 ms poll loop easily affords this).
+    search_end = min(len(previous), 10000)
+    for i in range(1, search_end):
+        if current.startswith(previous[i:]):
+            return current[len(previous[i:]):]
+    # No overlap found — treat entire current as new (safety fallback)
+    return current
+
+
 def _create_session(timeout: int = 120, cwd: str | None = None) -> str | None:
     opencode = _opencode_cmd()
     inner = (
@@ -863,6 +893,9 @@ def start_prompt_background(prompt: str, mode: str = "summary") -> str:
             _STATE_COMPLETING = "COMPLETING"
 
             last_extracted = ""
+            live_buffer = ""
+            _last_raw_capture = ""
+            _raw_buffer = ""
             session_alive = True
             poll_count = 0
             poll_t0 = time.monotonic()
@@ -888,30 +921,46 @@ def start_prompt_background(prompt: str, mode: str = "summary") -> str:
                 cap_elapsed = time.monotonic() - cap_t0
                 capture_size = len(current)
                 last_line = (current.strip().split("\n") or [""])[-1][:120]
-                extracted = _extract_response(current, prompt)
-                extracted_len = len(extracted)
-                new_lines = extracted_len - len(last_extracted)
 
-                # Detect signals
+                # ── Append-only buffer accumulation ───────────────────
+                # Accumulate raw pane content; never replace the buffer.
+                new_raw = _diff_captures(_last_raw_capture, current)
+                if new_raw:
+                    _raw_buffer += new_raw
+                _last_raw_capture = current
+
+                # Extract response from the stable accumulated buffer,
+                # NOT from the live tmux capture.
+                extracted = _extract_response(_raw_buffer, prompt)
+                extracted_len = len(extracted)
+
+                # Detect signals (current capture still used for
+                # idle/busy detection since those look at terminal state)
                 has_idle_prompt = _has_idle_prompt(current)
                 is_busy = _has_busy_indicators(current)
                 text_changed = extracted != last_extracted
                 is_meaningful = extracted_len >= 20
 
-                _dbg(f"PROMPT[{prompt_id}] state={state} capture size={capture_size} last={last_line!r} extracted={extracted_len} new={new_lines} idle_prompt={has_idle_prompt} busy={is_busy} cap_took={cap_elapsed*1000:.0f}ms")
+                _dbg(f"PROMPT[{prompt_id}] state={state} capture size={capture_size} last={last_line!r} extracted={extracted_len} new={extracted_len - len(last_extracted)} idle_prompt={has_idle_prompt} busy={is_busy} cap_took={cap_elapsed*1000:.0f}ms _raw_buffer_len={len(_raw_buffer)}")
 
                 if is_busy:
                     _dbg(f"PROMPT[{prompt_id}] busy_indicator_detected=True")
                 if has_idle_prompt:
                     _dbg(f"PROMPT[{prompt_id}] idle_prompt_detected=True")
 
-                # ── State machine ──────────────────────────────────────
-
+                # ── Append-only prompt buffer update ──────────────────
+                # Because _raw_buffer only grows and _extract_response is
+                # a pure function, the extracted text can only grow (or
+                # stay the same).  We never replace the buffer.
                 if text_changed:
+                    if len(extracted) > len(last_extracted):
+                        delta = extracted[len(last_extracted):]
+                        live_buffer = extracted
+                        if delta:
+                            with _prompt_lock:
+                                _prompt_state["live_buffer"] = live_buffer
+                                _prompt_state["progress"] = live_buffer
                     last_extracted = extracted
-                    if extracted:
-                        with _prompt_lock:
-                            _prompt_state["progress"] = extracted
 
                 if state == _STATE_WAITING:
                     if is_meaningful:
@@ -971,8 +1020,8 @@ def start_prompt_background(prompt: str, mode: str = "summary") -> str:
 
             # 3. Final result — use opencode export for ground truth
             elapsed = time.monotonic() - poll_t0
-            result = last_extracted
             export_success = False
+            final_result = None
             sid = _current_session_id
 
             # Only attempt export if session is alive — dead sessions won't export
@@ -992,25 +1041,22 @@ def start_prompt_background(prompt: str, mode: str = "summary") -> str:
                     msgs = exported.get("messages", [])
                     for m in reversed(msgs):
                         if m.get("role") == "assistant" and m.get("content", "").strip():
-                            reply = m["content"].strip()
-                            if len(reply) >= len(result):
-                                result = reply
-                                _dbg(f"PROMPT[{prompt_id}] export reply (len={len(result)}) replaces pane (len={len(last_extracted)})")
-                            else:
-                                _dbg(f"PROMPT[{prompt_id}] keeping pane (len={len(result)}) > export reply (len={len(reply)})")
+                            final_result = m["content"].strip()
+                            _dbg(f"PROMPT[{prompt_id}] final_result=export reply (len={len(final_result)})")
                             break
 
             if completion_reason is None:
                 completion_reason = "unknown"
 
-            _dbg(f"PROMPT[{prompt_id}] done elapsed={elapsed:.1f}s polls={poll_count} result_len={len(result)} reason={completion_reason} export_ok={export_success}")
+            _dbg(f"PROMPT[{prompt_id}] done elapsed={elapsed:.1f}s polls={poll_count} live_buffer_len={len(live_buffer)} final_result_len={len(final_result or '')} reason={completion_reason} export_ok={export_success}")
 
             with _prompt_lock:
                 _prompt_state["running"] = False
                 _prompt_state["done"] = True
                 _prompt_state["completion_reason"] = completion_reason
                 _prompt_state["export_success"] = export_success
-                _prompt_state["result"] = result or None
+                _prompt_state["final_result"] = final_result
+                _prompt_state["result"] = final_result or live_buffer or None
                 _prompt_state.pop("progress", None)
 
         except Exception as e:
@@ -1028,6 +1074,8 @@ def start_prompt_background(prompt: str, mode: str = "summary") -> str:
             "prompt_id": prompt_id,
             "running": True,
             "done": False,
+            "live_buffer": "",
+            "final_result": None,
             "progress": "",
             "result": None,
             "error": None,
