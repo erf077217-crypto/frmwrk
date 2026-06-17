@@ -107,13 +107,21 @@ class SessionPromptRequest(BaseModel):
 
 @app.post("/session/prompt")
 async def session_prompt(req: SessionPromptRequest):
-    prompt_id = ocs.start_prompt_background(req.prompt, mode=req.mode)
-    return {"prompt_id": prompt_id, "success": True, "mode": req.mode}
+    return ocs.start_prompt_background(req.prompt, mode=req.mode)
 
 
-@app.get("/session/prompt-status/{prompt_id}")
-async def session_prompt_status(prompt_id: str):
-    return ocs.get_prompt_status(prompt_id)
+@app.get("/session/fetch-response")
+async def session_fetch_response():
+    """Manually fetch the latest assistant response from OpenCode.
+
+    Pure read — no side effects.  Works independently of any polling.
+    Returns the most recent assistant message content via opencode export.
+    """
+    status = ocs.get_session_status()
+    sid = status.get("session_id")
+    if not sid or not status.get("active"):
+        return {"success": False, "error": "No active OpenCode session"}
+    return ocs.get_latest_response(sid)
 
 
 @app.get("/session/status")

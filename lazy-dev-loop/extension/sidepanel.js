@@ -28,6 +28,7 @@ let currentMode          = "summary";
 
 // Response
 const responseViewer     = document.getElementById("responseViewer");
+const fetchBtn           = document.getElementById("fetchBtn");
 const insertBtn          = document.getElementById("insertBtn");
 
 // Terminal
@@ -143,9 +144,11 @@ function render(data) {
   if (!active) {
     responseViewer.disabled = true;
     responseViewer.placeholder = "(start a session to send prompts)";
+    fetchBtn.disabled = true;
     insertBtn.disabled = true;
   } else {
     responseViewer.disabled = false;
+    fetchBtn.disabled = false;
   }
 }
 
@@ -194,6 +197,7 @@ async function stopCurrentSession() {
     await fetch(`${BRIDGE}/session/stop`, { method: "POST" });
     setStatus("Session stopped", "status-ok");
     responseViewer.value = "";
+    fetchBtn.disabled = true;
     insertBtn.disabled = true;
     await fetchSessionStatus();
   } catch (err) {
@@ -215,6 +219,7 @@ async function sendPrompt(prompt) {
   if (!prompt.trim()) return;
 
   responseViewer.value = "";
+  fetchBtn.disabled = true;
   insertBtn.disabled = true;
   sendBtn.disabled = true;
   setStatus("Sending prompt…", "status-info");
@@ -226,65 +231,21 @@ async function sendPrompt(prompt) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ prompt, mode: currentMode }),
     });
-    const { prompt_id, success, error } = await r.json();
+    const data = await r.json();
 
-    if (!success) {
-      setStatus(`Error: ${error || "Unknown"}`, "status-err");
-      responseViewer.value = `Error: ${error}`;
-      sendBtn.disabled = false;
-      return;
-    }
-
-    const pollUrl = `${BRIDGE}/session/prompt-status/${prompt_id}`;
-    let done = false;
-
-    while (!done) {
-      await new Promise((r) => setTimeout(r, 500));
-      const pr = await fetch(pollUrl);
-      const ps = await pr.json();
-
-      if (ps.error) {
-        setStatus(`Error: ${ps.error}`, "status-err");
-        break;
-      }
-
-      if (ps.progress) {
-        responseViewer.value = ps.progress;
-      }
-
-      if (ps.done) {
-        done = true;
-        if (ps.error) {
-          setStatus(`Error: ${ps.error}`, "status-err");
-          responseViewer.value = `Error: ${ps.error}`;
-        } else {
-          const finalText = ps.result || ps.progress || "";
-          responseViewer.value = finalText || "(no output)";
-          debug(`Response: ${finalText.length} chars, reason=${ps.completion_reason}, export_ok=${ps.export_success}`);
-          if (finalText) {
-            if (ps.export_success === false) {
-              setStatus("Response ready (export failed)", "status-warn");
-            } else {
-              setStatus("Response ready", "status-ok");
-            }
-            insertBtn.disabled = false;
-          } else {
-            setStatus("Empty response", "status-err");
-          }
-        }
-      } else {
-        if (currentMode === "summary") {
-          const dots = ".".repeat((Math.floor(Date.now() / 1000) % 3) + 1);
-          setStatus(`Running${dots}`, "status-info");
-        } else {
-          setStatus("Running (raw)", "status-err");
-        }
-      }
+    if (!data.success) {
+      setStatus(`Error: ${data.error || "Unknown"}`, "status-err");
+      responseViewer.value = `Error: ${data.error}`;
+    } else {
+      // Prompt sent. User watches terminal and clicks Fetch when ready.
+      setStatus("Prompt sent — Fetch response when OpenCode finishes.", "status-info");
+      debug("Prompt sent, waiting for user to fetch response");
     }
   } catch (err) {
     setStatus(`Error: ${err.message}`, "status-err");
     responseViewer.value = `Failed to send prompt:\n${err.message}`;
   } finally {
+    fetchBtn.disabled = false;
     sendBtn.disabled = false;
   }
 }
@@ -296,6 +257,34 @@ promptInput.addEventListener("keydown", (e) => {
     sendPrompt(promptInput.value);
   }
 });
+
+// ── Fetch Response (manual) ──────────────────────────────────────────────
+
+async function fetchResponse() {
+  fetchBtn.disabled = true;
+  setStatus("Fetching response…", "status-info");
+  try {
+    const r = await fetch(`${BRIDGE}/session/fetch-response`);
+    const data = await r.json();
+    if (data.success && data.response) {
+      responseViewer.value = data.response;
+      setStatus("Response fetched", "status-ok");
+      insertBtn.disabled = false;
+      debug(`Fetched response: ${data.response.length} chars`);
+    } else {
+      const errMsg = data.error || "No response available";
+      setStatus(errMsg, "status-warn");
+      debug(`Fetch failed: ${errMsg}`);
+    }
+  } catch (err) {
+    setStatus(`Error: ${err.message}`, "status-err");
+    debug(`Fetch error: ${err.message}`);
+  } finally {
+    fetchBtn.disabled = false;
+  }
+}
+
+fetchBtn.addEventListener("click", fetchResponse);
 
 // ── Insert Into ChatGPT ──────────────────────────────────────────────────
 

@@ -4,9 +4,9 @@ import re
 import select
 import shlex
 import subprocess
+import tempfile
 import threading
 import time
-import uuid
 
 import config
 import workspace_manager as wm
@@ -99,17 +99,37 @@ def _tmux(tmux_args: str) -> tuple[str, str, int]:
 
 
 def _opencode_cli(*args: str) -> tuple[str, str, int]:
+    """Run an opencode CLI command and return (stdout, stderr, returncode).
+
+    Uses a temp file to capture stdout instead of a pipe.  This works
+    around a Node.js bug where ``process.stdout.write()`` (used by
+    ``console.log``) silently truncates output at ~64 KiB when stdout
+    is connected to a pipe.
+    """
     inner = " ".join(shlex.quote(a) for a in args)
+    fd, tmp_path = tempfile.mkstemp(suffix=".json", dir="/tmp")
+    os.close(fd)
+    os.chmod(tmp_path, 0o666)  # writable by sudo_user if bridge runs as root
     try:
         result = platform.run(
-            f"cd /tmp && {_opencode_cmd()} {inner} 2>/dev/null",
+            f"cd /tmp && {_opencode_cmd()} {inner} >{shlex.quote(tmp_path)} 2>/dev/null",
             timeout=30,
         )
-        return result.stdout, result.stderr, result.returncode
+        try:
+            with open(tmp_path, "r", encoding="utf-8") as f:
+                stdout = f.read()
+        except (OSError, UnicodeDecodeError):
+            stdout = ""
+        return stdout, result.stderr, result.returncode
     except subprocess.TimeoutExpired:
         return "", "timeout", -1
     except FileNotFoundError:
         return "", platform.env_not_found_message, -1
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 def _escape_single_quotes(text: str) -> str:
@@ -556,23 +576,8 @@ def _recover_env():
     if old_sid is not None:
         _dbg(f"SESSION RECOVERY: cleared stale bridge session_id={old_sid}")
 
-    # 4. Clear any in-flight prompt state
-    _reset_prompt_state()
-
     _dbg(f"SESSION RECOVERY: complete (tmux={cleaned['tmux']} opencode={cleaned['opencode']})")
 
-
-def _reset_prompt_state():
-    """Safely clear ALL in-flight prompt states."""
-    with _prompt_states_lock:
-        for pid, state in list(_prompt_states.items()):
-            if state.get("running"):
-                _dbg(f"SESSION RECOVERY: clearing in-flight prompt {pid}")
-            state["cancelled"] = True
-            state["running"] = False
-            state["done"] = True
-            state["completion_reason"] = "session-reset"
-        _prompt_states.clear()
 
 
 # ── Verified shutdown (stops and verifies cleanup) ─────────────────────────
@@ -613,10 +618,9 @@ def _verified_shutdown() -> dict:
     else:
         _dbg("SESSION SHUTDOWN: no orphaned opencode processes")
 
-    # Step D — clear bridge state and in-flight prompts
+    # Step D — clear bridge state
     _current_session_id = None
     _session_started_at = None
-    _reset_prompt_state()
     _dbg("SESSION SHUTDOWN: complete")
 
     return {"success": True, "session_id": sid}
@@ -840,330 +844,79 @@ def open_terminal() -> dict:
     return _active.open_terminal()
 
 
-# ── background prompt processing (via tmux send-keys + capture-pane) --------
+# ── prompt sending (dumb transport — no completion detection) ----------------
 
-# Dict-of-dicts keyed by prompt_id — each prompt thread owns its own slot.
-# Never replaced wholesale; only individual entries are added/removed.
-_prompt_states: dict[str, dict] = {}
-_prompt_states_lock = threading.Lock()
+def start_prompt_background(prompt: str, mode: str = "summary") -> dict:
+    """Send a prompt into the running OpenCode TUI.
 
-_MAX_RAW_BUFFER = 500 * 1024  # 500 KB cap for _raw_buffer per prompt
-
-# Confirmation period: idle prompt must be stable for this long before completing
-_IDLE_CONFIRM_SECONDS = 2.0
-
-# Safety timeout: if a prompt runs longer than this, force-complete it
-_MAX_PROMPT_DURATION = 30 * 60  # 30 minutes
-
-
-def _cancel_other_prompts(new_prompt_id: str) -> None:
-    """Mark all running prompts except *new_prompt_id* as cancelled."""
-    with _prompt_states_lock:
-        for pid, state in list(_prompt_states.items()):
-            if pid != new_prompt_id and state.get("running") and not state.get("done"):
-                state["cancelled"] = True
-                _dbg(f"PROMPT[{pid}] cancelled by PROMPT[{new_prompt_id}]")
-
-
-def _cleanup_stale_states() -> None:
-    """Remove completed/cancelled states older than 5 minutes."""
-    now = time.monotonic()
-    with _prompt_states_lock:
-        for pid, state in list(_prompt_states.items()):
-            ts = state.get("_completed_at")
-            if ts and (now - ts) > 300:
-                del _prompt_states[pid]
-
-
-def start_prompt_background(prompt: str, mode: str = "summary") -> str:
-    _cleanup_stale_states()
-    prompt_id = uuid.uuid4().hex[:8]
-    _dbg(f"PROMPT[{prompt_id}] created mode={mode} prompt={prompt[:60]!r}")
-
-    has_sess_t0 = time.monotonic()
+    Pure transport — no completion detection, no polling, no state machine.
+    The user determines when OpenCode has finished and clicks Fetch Response.
+    """
     has_sess_ok = _tmux(f"has-session -t {TMUX_SESSION_NAME}")[2] == 0
-    _dbg(f"PROMPT[{prompt_id}] has-session: {has_sess_ok} ({time.monotonic()-has_sess_t0:.3f}s)")
     if not has_sess_ok:
-        state = {
-            "prompt_id": prompt_id,
-            "running": False,
-            "done": True,
-            "result": None,
-            "error": "No active tmux session. Start a session first.",
-            "mode": mode,
+        return {"success": False, "error": "No active tmux session. Start a session first."}
+
+    escaped = _escape_single_quotes(prompt)
+    _, stderr, rc = _tmux(
+        f"send-keys -t {TMUX_SESSION_NAME} '{escaped}' Enter"
+    )
+    if rc != 0:
+        return {"success": False, "error": stderr or "tmux send-keys failed"}
+
+    _dbg(f"send-prompt: prompt={prompt[:60]!r} sent via tmux")
+    return {"success": True}
+
+
+def get_latest_response(session_id: str) -> dict:
+    """Fetch the latest assistant response from an OpenCode session.
+
+    Pure read — no side effects, no tmux, no screen scraping.
+    Calls opencode export <session_id> and returns the most recent
+    assistant message content.
+
+    Returns:
+        dict with keys:
+          success (bool)
+          response (str | None) — latest assistant message content
+          message_count (int)   — total normalized messages
+          error (str | None)    — human-readable error if any
+    """
+    exported = _session_export(session_id)
+    if exported is None:
+        return {
+            "success": False,
+            "response": None,
+            "message_count": 0,
+            "error": "Failed to export session. Session may not exist or OpenCode may not be ready.",
         }
-        with _prompt_states_lock:
-            _prompt_states[prompt_id] = state
-        return prompt_id
 
-    # Cancel any other running prompt — each prompt owns its own thread
-    _cancel_other_prompts(prompt_id)
+    messages = exported.get("messages", [])
+    if not messages:
+        return {
+            "success": False,
+            "response": None,
+            "message_count": 0,
+            "error": "Session has no messages yet.",
+        }
 
-    state: dict = {
-        "prompt_id": prompt_id,
-        "running": True,
-        "done": False,
-        "live_buffer": "",
-        "final_result": None,
-        "progress": "",
-        "result": None,
-        "error": None,
-        "mode": mode,
-        "cancelled": False,
-        "_completed_at": None,
+    # Walk backwards to find the newest assistant message.
+    for m in reversed(messages):
+        if m.get("role") == "assistant":
+            content = (m.get("content") or "").strip()
+            if content:
+                return {
+                    "success": True,
+                    "response": content,
+                    "message_count": len(messages),
+                    "error": None,
+                }
+
+    return {
+        "success": False,
+        "response": None,
+        "message_count": len(messages),
+        "error": "No assistant response found yet. OpenCode may still be processing.",
     }
-    with _prompt_states_lock:
-        _prompt_states[prompt_id] = state
-
-    def _is_session_alive() -> bool:
-        return _tmux(f"has-session -t {TMUX_SESSION_NAME}")[2] == 0
-
-    def _run():
-        completion_reason = None
-        try:
-            _dbg(f"PROMPT[{prompt_id}] queued")
-
-            # ── 1. Baseline capture BEFORE sending prompt ─────────────
-            # This ensures _raw_buffer starts empty and only accumulates
-            # content that appears AFTER the prompt is sent.
-            baseline = _capture_pane_full_history()
-            _last_raw_capture = baseline
-
-            # ── 2. Send prompt into the running opencode TUI ──────────
-            send_t0 = time.monotonic()
-            escaped = _escape_single_quotes(prompt)
-            _, stderr, rc = _tmux(
-                f"send-keys -t {TMUX_SESSION_NAME} '{escaped}' Enter"
-            )
-            send_elapsed = time.monotonic() - send_t0
-            _dbg(f"PROMPT[{prompt_id}] send-keys rc={rc} took={send_elapsed*1000:.0f}ms")
-            if rc != 0:
-                completion_reason = "send-keys-failed"
-                _dbg(f"PROMPT[{prompt_id}] send-keys-failed stderr={stderr!r}")
-                state["error"] = stderr or "tmux send-keys failed"
-                state["running"] = False
-                state["done"] = True
-                state["_completed_at"] = time.monotonic()
-                return
-
-            # ── 3. Poll capture-pane with state machine ───────────────
-            _STATE_WAITING = "WAITING_FOR_FIRST_OUTPUT"
-            _STATE_GENERATING = "GENERATING"
-            _STATE_BUSY = "BUSY_NO_VISIBLE_OUTPUT"
-            _STATE_COMPLETING = "COMPLETING"
-
-            last_extracted = ""
-            live_buffer = ""
-            _raw_buffer = ""
-            session_alive = True
-            poll_count = 0
-            poll_t0 = time.monotonic()
-            last_progress_report = 0.0
-            processing_state = _STATE_WAITING
-            completing_since: float | None = None
-
-            while True:
-                time.sleep(0.25)
-                poll_count += 1
-
-                # ── Cancellation check ───────────────────────────────
-                if state.get("cancelled"):
-                    completion_reason = "cancelled"
-                    _dbg(f"PROMPT[{prompt_id}] cancelled externally")
-                    break
-
-                # ── Safety timeout ───────────────────────────────────
-                elapsed_total = time.monotonic() - poll_t0
-                if elapsed_total > _MAX_PROMPT_DURATION:
-                    completion_reason = "timeout"
-                    _dbg(f"PROMPT[{prompt_id}] safety timeout after {elapsed_total:.0f}s")
-                    break
-
-                # ── Session health check (every 20 polls ≈ 5s) ───────
-                if poll_count % 20 == 0:
-                    if not _is_session_alive():
-                        completion_reason = "session-died"
-                        session_alive = False
-                        _dbg(f"PROMPT[{prompt_id}] session-died (poll={poll_count})")
-                        break
-
-                # ── Capture content (SCROLL-INDEPENDENT) ──────────────
-                cap_t0 = time.monotonic()
-                current = _capture_pane_full_history()
-                cap_elapsed = time.monotonic() - cap_t0
-                capture_size = len(current)
-
-                # ── Append-only buffer accumulation ───────────────────
-                # new_raw is the content that appeared in the pane since
-                # the last poll.  With -S -, captures always start from
-                # the beginning of history, so _diff_captures correctly
-                # identifies new content via monotonic prefix growth.
-                new_raw = _diff_captures(_last_raw_capture, current)
-                if new_raw:
-                    _raw_buffer += new_raw
-                    # Bounded buffer: if _raw_buffer exceeds 2× the limit,
-                    # discard content from the MIDDLE, keeping head+tail.
-                    # The head contains the prompt echo needed for extraction;
-                    # the tail has the most recent response content.
-                    if len(_raw_buffer) > _MAX_RAW_BUFFER * 2:
-                        head = _raw_buffer[:_MAX_RAW_BUFFER // 2]
-                        tail = _raw_buffer[-(_MAX_RAW_BUFFER // 2):]
-                        _raw_buffer = head + "\n... [TRUNCATED] ...\n" + tail
-                        _dbg(f"PROMPT[{prompt_id}] trimmed _raw_buffer to {len(_raw_buffer)} bytes")
-                _last_raw_capture = current
-
-                # ── Extract response from stable buffer ───────────────
-                extracted = _extract_response(_raw_buffer, prompt)
-                extracted_len = len(extracted)
-
-                # ── Idle/busy detection (last 30 lines ≈ visible pane) ─
-                # Use a suffix of the full-history capture rather than
-                # a separate capture-pane call (avoids I/O overhead).
-                visible = "\n".join(current.split("\n")[-30:])
-                has_idle_prompt = _has_idle_prompt(visible)
-                is_busy = _has_busy_indicators(visible)
-                text_changed = extracted != last_extracted
-                is_meaningful = extracted_len >= 20
-
-                _dbg(
-                    f"PROMPT[{prompt_id}] state={processing_state} "
-                    f"capture_size={capture_size} "
-                    f"extracted={extracted_len} "
-                    f"new={extracted_len - len(last_extracted)} "
-                    f"idle_prompt={has_idle_prompt} "
-                    f"busy={is_busy} "
-                    f"cap_took={cap_elapsed*1000:.0f}ms "
-                    f"_raw_buffer_len={len(_raw_buffer)}"
-                )
-
-                # ── Update live buffer ───────────────────────────────
-                if text_changed and len(extracted) > len(last_extracted):
-                    live_buffer = extracted
-                    state["live_buffer"] = live_buffer
-                    state["progress"] = live_buffer
-                    last_extracted = extracted
-
-                # ── State machine ─────────────────────────────────────
-                if processing_state == _STATE_WAITING:
-                    if is_meaningful:
-                        processing_state = _STATE_GENERATING
-                        _dbg(f"PROMPT[{prompt_id}] transition: WAITING -> GENERATING")
-                    elif has_idle_prompt and not is_busy:
-                        processing_state = _STATE_COMPLETING
-                        completing_since = time.monotonic()
-                        _dbg(f"PROMPT[{prompt_id}] transition: WAITING -> COMPLETING")
-
-                elif processing_state == _STATE_GENERATING:
-                    if text_changed:
-                        if elapsed_total - last_progress_report >= 30.0:
-                            last_progress_report = elapsed_total
-                            _dbg(f"PROMPT[{prompt_id}] progress (poll={poll_count}, elapsed={elapsed_total:.1f}s, extracted_len={extracted_len})")
-                    if has_idle_prompt and not is_busy:
-                        processing_state = _STATE_COMPLETING
-                        completing_since = time.monotonic()
-                        _dbg(f"PROMPT[{prompt_id}] transition: GENERATING -> COMPLETING")
-                    elif is_busy:
-                        processing_state = _STATE_BUSY
-                        _dbg(f"PROMPT[{prompt_id}] transition: GENERATING -> BUSY")
-
-                elif processing_state == _STATE_BUSY:
-                    if text_changed:
-                        processing_state = _STATE_GENERATING
-                        _dbg(f"PROMPT[{prompt_id}] transition: BUSY -> GENERATING")
-                    elif has_idle_prompt and not is_busy:
-                        processing_state = _STATE_COMPLETING
-                        completing_since = time.monotonic()
-                        _dbg(f"PROMPT[{prompt_id}] transition: BUSY -> COMPLETING")
-
-                elif processing_state == _STATE_COMPLETING:
-                    if text_changed:
-                        processing_state = _STATE_GENERATING
-                        completing_since = None
-                        _dbg(f"PROMPT[{prompt_id}] transition: COMPLETING -> GENERATING (text resumed)")
-                    elif is_busy:
-                        processing_state = _STATE_BUSY
-                        completing_since = None
-                        _dbg(f"PROMPT[{prompt_id}] transition: COMPLETING -> BUSY")
-                    elif not has_idle_prompt:
-                        processing_state = _STATE_BUSY
-                        completing_since = None
-                        _dbg(f"PROMPT[{prompt_id}] transition: COMPLETING -> BUSY (idle lost)")
-                    elif completing_since is not None and (time.monotonic() - completing_since) >= _IDLE_CONFIRM_SECONDS:
-                        completion_reason = "idle-complete"
-                        _dbg(f"PROMPT[{prompt_id}] completed (idle_for={time.monotonic()-completing_since:.1f}s)")
-                        break
-
-            # ── 4. Final result — opencode export for ground truth ────
-            export_success = False
-            final_result = None
-            sid = _current_session_id
-
-            if sid and session_alive:
-                _dbg(f"PROMPT[{prompt_id}] export start session={sid}")
-                exported = _session_export(sid)
-                for retry in range(10):
-                    if exported is not None:
-                        export_success = True
-                        break
-                    _dbg(f"PROMPT[{prompt_id}] export retry {retry + 1}/10 session={sid}")
-                    time.sleep(2.0)
-                    exported = _session_export(sid)
-
-                if export_success:
-                    msgs = exported.get("messages", [])
-                    for m in reversed(msgs):
-                        if m.get("role") == "assistant" and m.get("content", "").strip():
-                            final_result = m["content"].strip()
-                            _dbg(f"PROMPT[{prompt_id}] final_result from export (len={len(final_result)})")
-                            break
-
-            if completion_reason is None:
-                completion_reason = "unknown"
-
-            elapsed = time.monotonic() - poll_t0
-            _dbg(
-                f"PROMPT[{prompt_id}] done elapsed={elapsed:.1f}s "
-                f"polls={poll_count} "
-                f"live_buffer_len={len(live_buffer)} "
-                f"final_result_len={len(final_result or '')} "
-                f"reason={completion_reason} "
-                f"export_ok={export_success}"
-            )
-
-            now = time.monotonic()
-            state["running"] = False
-            state["done"] = True
-            state["completion_reason"] = completion_reason
-            state["export_success"] = export_success
-            state["final_result"] = final_result
-            state["result"] = final_result or live_buffer or None
-            state.pop("progress", None)
-            state["_completed_at"] = now
-
-        except Exception as e:
-            completion_reason = "exception"
-            _dbg(f"PROMPT[{prompt_id}] exception: {e}")
-            state["completion_reason"] = completion_reason
-            state["error"] = str(e)
-            state["running"] = False
-            state["done"] = True
-            state["_completed_at"] = time.monotonic()
-
-    _dbg(f"PROMPT[{prompt_id}] started")
-    thread = threading.Thread(target=_run, daemon=True)
-    thread.start()
-    return prompt_id
 
 
-def get_prompt_status(prompt_id: str) -> dict:
-    with _prompt_states_lock:
-        state = _prompt_states.get(prompt_id)
-        if state is None:
-            _dbg(f"PROMPT[{prompt_id}] NOT FOUND, active={list(_prompt_states.keys())}")
-            return {"error": "prompt_id not found"}
-        copied = dict(state)
-        done = copied.get("done")
-        running = copied.get("running")
-        result_len = len(copied.get("result", "") or "")
-        _dbg(f"PROMPT[{prompt_id}] status done={done} running={running} result_len={result_len}")
-        return copied
+

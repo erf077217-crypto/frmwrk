@@ -7,7 +7,7 @@ from tmux_session import (  # noqa: F401
     start_session,
     stop_session,
     start_prompt_background,
-    get_prompt_status,
+    get_latest_response,
     open_terminal,
     set_debug,
     is_debug_enabled,
