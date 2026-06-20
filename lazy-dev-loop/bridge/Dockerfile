@@ -21,7 +21,11 @@ COPY . .
 
 RUN chmod +x /app/docker-entrypoint.sh
 
-RUN useradd -m -u 1000 app
+RUN useradd -m -u 1000 app && \
+    mkdir -p /home/app/.local/share/opencode && \
+    mkdir -p /home/app/.config/opencode && \
+    mkdir -p /home/app/.cache/opencode && \
+    chown -R app:app /home/app
 
 USER app
 

@@ -175,7 +175,7 @@ class TmuxSession:
             }
 
         ws = wm.get_workspace()
-        workspace_path = ws.get("workspace") or config.WORKSPACE_PATH
+        workspace_path = ws.get("workspace")
         if not workspace_path:
             return {
                 "success": False,

@@ -57,7 +57,7 @@ class WorkspaceRequest(BaseModel):
 
 @app.get("/workspace")
 async def get_workspace():
-    return wm.get_workspace()
+    return wm.get_workspace_display()
 
 
 @app.post("/workspace")
