@@ -45,7 +45,7 @@ class LinuxPlatform:
     def open_terminal(self, session_name: str) -> dict:
         # Try to find the container name from the hostname
         hostname = os.uname().nodename
-        cmd = f"docker exec -it {hostname} tmux attach -t {shlex.quote(session_name)}"
+        cmd = f"docker exec -it --user app {hostname} tmux attach -t {shlex.quote(session_name)}"
         return {
             "success": False,
             "need_terminal": True,
