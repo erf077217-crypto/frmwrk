@@ -321,23 +321,29 @@ insertBtn.addEventListener("click", async () => {
 
 async function fetchWorkspace() {
   try {
+    debug(`[DIAG] GET ${BRIDGE}/workspace`);
     const r = await fetch(`${BRIDGE}/workspace`);
     const data = await r.json();
+    debug(`[DIAG] GET /workspace response: ${JSON.stringify(data)}`);
     workspacePath.textContent = data.workspace || "(not set)";
   } catch (err) {
-    debug(`fetchWorkspace: ${err.message}`);
+    debug(`[DIAG] fetchWorkspace error: ${err.message}`);
   }
 }
 
 async function setWorkspace(path) {
+  debug(`[DIAG A] User-selected path from UI input: "${path}"`);
   setStatus("Setting workspace…", "status-info");
   try {
+    const payload = JSON.stringify({ path });
+    debug(`[DIAG B] POST payload to ${BRIDGE}/workspace: ${payload}`);
     const r = await fetch(`${BRIDGE}/workspace`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path }),
+      body: payload,
     });
     const data = await r.json();
+    debug(`[DIAG B] Response status=${r.status} body=${JSON.stringify(data)}`);
     if (data.success) {
       setStatus(`Workspace: ${data.workspace}`, "status-ok");
       workspacePath.textContent = data.workspace;
