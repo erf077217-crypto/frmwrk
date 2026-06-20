@@ -129,6 +129,13 @@ def _create_session(timeout: int = 120, cwd: str | None = None) -> str | None:
     try:
         result = platform.run(inner, timeout=timeout, cwd=cwd)
         stdout = result.stdout or ""
+        stderr = result.stderr or ""
+        _dbg(f"_create_session: rc={result.returncode} stdout_len={len(stdout)} "
+             f"stderr_len={len(stderr)} cwd={cwd}")
+        if stdout:
+            _dbg(f"_create_session: stdout preview: {stdout[:500]!r}")
+        if stderr:
+            _dbg(f"_create_session: stderr: {stderr[:500]!r}")
         for line in stdout.split("\n"):
             line = line.strip()
             if not line:
@@ -136,6 +143,7 @@ def _create_session(timeout: int = 120, cwd: str | None = None) -> str | None:
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
+                _dbg(f"_create_session: non-JSON line: {line[:200]!r}")
                 continue
             if event.get("type") == "step_start":
                 return event.get("sessionID")
