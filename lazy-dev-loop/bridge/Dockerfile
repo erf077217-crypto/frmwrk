@@ -4,6 +4,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     gnupg \
     tmux \
+    util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
@@ -27,8 +28,6 @@ RUN useradd -m -u 1000 app && \
     mkdir -p /home/app/.cache/opencode && \
     mkdir -p /home/app/.local/share/lazy-dev-loop && \
     chown -R app:app /home/app
-
-USER app
 
 EXPOSE 7777
 

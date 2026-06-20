@@ -62,8 +62,6 @@ BRIDGE_PORT=7777
 RUN_TIMEOUT=120
 DEBUG_OUTPUT=true
 TMUX_SESSION_NAME=lazy-dev-loop
-UID=$(id -u)
-GID=$(id -g)
 EOF
         warn "  >> Edit .env and set OPENAI_API_KEY=sk-..."
     fi
