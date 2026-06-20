@@ -220,10 +220,9 @@ class TmuxSession:
         opencode_cmd = (
             f"{_opencode_cmd()} --session {shlex.quote(session_id)} {shlex.quote(workspace_path)}"
         )
-        create_out = _tmux(
-            f"new-session -d -s {sname} {shlex.quote(opencode_cmd)}"
-        )
-
+        # Create session with a shell first, then send the command.
+        # This way the shell keeps the session alive after opencode exits.
+        create_out = _tmux(f"new-session -d -s {sname}")
         if create_out[2] != 0:
             return {
                 "success": False,
@@ -232,6 +231,8 @@ class TmuxSession:
                     f"{create_out[1][:200] or 'unknown error'}"
                 ),
             }
+        escaped = _escape_single_quotes(opencode_cmd)
+        _tmux(f"send-keys -t {sname} '{escaped}' Enter")
 
         _current_session_id = session_id
         _session_started_at = time.monotonic()
