@@ -29,6 +29,9 @@ for dir in \
     fi
 done
 
-# Drop privileges to the app user and start the server
+# Drop privileges to the app user and start the server.
+# setpriv does NOT change $HOME — OpenCode (Bun) reads HOME to find its
+# data dir, so we must set it explicitly via env.
 exec setpriv --reuid="$APP_UID" --regid="$APP_GID" --init-groups \
+    env HOME=/home/app \
     uvicorn "$APP_MODULE" --host "$HOST" --port "$PORT"
