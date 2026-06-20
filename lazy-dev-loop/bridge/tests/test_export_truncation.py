@@ -29,17 +29,20 @@ class TestExportTruncation(unittest.TestCase):
         """Write large JSON to a file via subprocess shell redirect, verify no truncation."""
         LARGE_SIZE = 200_000
         platform = get_platform()
-        helper = "/tmp/truncation_helper.py"
         fd, tmp = tempfile.mkstemp(suffix=".json", dir="/tmp")
         os.close(fd)
         os.chmod(tmp, 0o666)
         try:
-            # Write JSON to the temp file inside the subprocess,
+            # Write large JSON content to the temp file inside the subprocess,
             # then confirm we can read it back completely.
-            result = platform.run(
-                f"python3 {helper} {tmp} {LARGE_SIZE}",
-                timeout=30,
+            script = (
+                f"python3 -c '"
+                f"import json; "
+                f"d={{\"messages\":[{{\"role\":\"user\",\"content\":\"x\"*{LARGE_SIZE}}}]}}; "
+                f"open(\"{tmp}\",\"w\").write(json.dumps(d))"
+                f"'"
             )
+            result = platform.run(script, timeout=30)
             self.assertEqual(
                 result.returncode, 0,
                 f"helper failed: rc={result.returncode} stderr={result.stderr!r}",

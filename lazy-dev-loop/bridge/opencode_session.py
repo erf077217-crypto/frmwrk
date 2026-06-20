@@ -11,5 +11,4 @@ from tmux_session import (  # noqa: F401
     open_terminal,
     set_debug,
     is_debug_enabled,
-    check_session_health,
 )

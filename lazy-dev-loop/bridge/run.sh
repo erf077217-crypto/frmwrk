@@ -1,44 +1,71 @@
 #!/usr/bin/env bash
-# Lazy Developer Loop — Bridge startup script
-# Works in Git Bash, WSL, and other Unix-like shells on Windows.
-
+# Lazy Developer Loop — Bridge startup script (Linux)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_MODULE="main:app"
 HOST="0.0.0.0"
-PORT=7777
+PORT="${BRIDGE_PORT:-7777}"
 
-# Try known venv locations relative to the repo root
-VENV_PATHS=(
-  "$SCRIPT_DIR/../../.venv/Scripts/uvicorn.exe"
-  "$SCRIPT_DIR/../../.venv/bin/uvicorn"
-  "$SCRIPT_DIR/../../venv/Scripts/uvicorn.exe"
-  "$SCRIPT_DIR/../../venv/bin/uvicorn"
-)
+# ── Pre-flight checks ─────────────────────────────────────────────────
 
-UVIOCRN_CMD=""
-for candidate in "${VENV_PATHS[@]}"; do
-  if [ -x "$candidate" ]; then
-    UVICORN_CMD="$candidate"
-    break
+check_dep() {
+  if ! command -v "$1" &>/dev/null; then
+    echo "ERROR: Required dependency '$1' is not installed."
+    echo "  Install it with your package manager, e.g.:"
+    echo "    sudo apt install $1"
+    exit 1
   fi
-done
+}
+
+check_dep python3
+check_dep tmux
+
+# ── Python venv detection ─────────────────────────────────────────────
+
+# Locate the virtual environment root (look from script dir up to filesystem root)
+find_venv_root() {
+  local dir="$SCRIPT_DIR"
+  while [[ "$dir" != "/" ]]; do
+    if [[ -f "$dir/pyproject.toml" || -f "$dir/requirements.txt" || -f "$dir/setup.py" || -f "$dir/setup.cfg" ]]; then
+      echo "$dir"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+  # Fallback: assume the repo root is two levels up from bridge/
+  echo "$(cd "$SCRIPT_DIR/../.." && pwd)"
+}
+
+VENV_ROOT="$(find_venv_root)"
+VENV_DIR="${VENV_DIR:-$VENV_ROOT/.venv}"
+
+UVICORN_CMD=""
+VENV_UVICORN="$VENV_DIR/bin/uvicorn"
+if [ -x "$VENV_UVICORN" ]; then
+  UVICORN_CMD="$VENV_UVICORN"
+fi
 
 # Fallback: try PATH
 if [ -z "$UVICORN_CMD" ]; then
   if command -v uvicorn &>/dev/null; then
     UVICORN_CMD="uvicorn"
-  else
-    echo "ERROR: uvicorn not found."
-    echo ""
-    echo "  Tried:"
-    for p in "${VENV_PATHS[@]}"; do echo "    $p"; done
-    echo ""
-    echo "  Activate your venv or install dependencies:"
-    echo "    pip install -r \"$SCRIPT_DIR/requirements.txt\""
-    exit 1
   fi
+fi
+
+if [ -z "$UVICORN_CMD" ]; then
+  echo "ERROR: uvicorn not found."
+  echo ""
+  echo "  Expected at: $VENV_UVICORN"
+  echo "  Also checked: PATH"
+  echo ""
+  echo "  Create and activate a virtual environment:"
+  echo "    python3 -m venv \"$VENV_DIR\""
+  echo "    source \"$VENV_DIR/bin/activate\""
+  echo "    pip install -r \"$SCRIPT_DIR/requirements.txt\""
+  echo ""
+  echo "  Or set VENV_DIR to point to your venv."
+  exit 1
 fi
 
 echo "============================================"

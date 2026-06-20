@@ -1,4 +1,10 @@
-const BRIDGE = "http://localhost:7777";
+const BRIDGE = (() => {
+  try {
+    const stored = localStorage.getItem("BRIDGE_URL");
+    if (stored) return stored;
+  } catch {}
+  return "http://localhost:7777";
+})();
 
 // ── DOM refs ──────────────────────────────────────────────────────────────
 

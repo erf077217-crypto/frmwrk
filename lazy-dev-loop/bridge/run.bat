@@ -1,5 +1,11 @@
 @echo off
-REM Lazy Developer Loop — Bridge startup script for native Windows (cmd.exe)
+REM ──────────────────────────────────────────────────────────────────────────
+REM  Lazy Developer Loop — Windows startup script
+REM
+REM  NOTICE: Linux is now the primary supported platform.
+REM  This script is retained for future Windows/WSL work and
+REM  is NOT tested as part of the current release.
+REM ──────────────────────────────────────────────────────────────────────────
 
 set "SCRIPT_DIR=%~dp0"
 set "APP_MODULE=main:app"

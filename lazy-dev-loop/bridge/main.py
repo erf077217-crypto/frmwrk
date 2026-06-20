@@ -16,11 +16,6 @@ app.add_middleware(
 )
 
 
-# ---------------------------------------------------------------------------
-# Health / diagnostics
-# ---------------------------------------------------------------------------
-
-
 class HealthResponse(BaseModel):
     status: str
     opencode_available: bool
@@ -36,19 +31,9 @@ async def health():
     )
 
 
-@app.get("/session/health")
-async def session_health():
-    return ocs.check_session_health()
-
-
 @app.get("/diagnostics")
 async def diagnostics():
     return opencode_runner.run_diagnostics()
-
-
-# ---------------------------------------------------------------------------
-# Legacy prompt endpoint
-# ---------------------------------------------------------------------------
 
 
 class PromptRequest(BaseModel):
@@ -66,11 +51,6 @@ async def handle_prompt(req: PromptRequest):
     return PromptResponse(**result)
 
 
-# ---------------------------------------------------------------------------
-# Workspace API
-# ---------------------------------------------------------------------------
-
-
 class WorkspaceRequest(BaseModel):
     path: str
 
@@ -83,11 +63,6 @@ async def get_workspace():
 @app.post("/workspace")
 async def set_workspace(req: WorkspaceRequest):
     return wm.set_workspace(req.path)
-
-
-# ---------------------------------------------------------------------------
-# Session API  —  backed by TmuxSession + OpenCode
-# ---------------------------------------------------------------------------
 
 
 @app.post("/session/start")
@@ -112,11 +87,6 @@ async def session_prompt(req: SessionPromptRequest):
 
 @app.get("/session/fetch-response")
 async def session_fetch_response():
-    """Manually fetch the latest assistant response from OpenCode.
-
-    Pure read — no side effects.  Works independently of any polling.
-    Returns the most recent assistant message content via opencode export.
-    """
     status = ocs.get_session_status()
     sid = status.get("session_id")
     if not sid or not status.get("active"):
@@ -135,19 +105,9 @@ async def session_preview(lines: int = Query(5, ge=1, le=50)):
     return {"preview": get_active().pane_preview(max_lines=lines)}
 
 
-# ---------------------------------------------------------------------------
-# Terminal launch
-# ---------------------------------------------------------------------------
-
-
 @app.post("/terminal/open")
 async def open_terminal():
     return ocs.open_terminal()
-
-
-# ---------------------------------------------------------------------------
-# Debug logging toggle (runtime flag, no restart required)
-# ---------------------------------------------------------------------------
 
 
 @app.get("/debug/status")
@@ -167,34 +127,28 @@ async def debug_disable():
     return {"enabled": False}
 
 
-# ---------------------------------------------------------------------------
-# Debug / diagnostics
-# ---------------------------------------------------------------------------
-
-
-@app.get("/debug/session")
-async def debug_session():
-    from tmux_session import _active, _current_session_id, TMUX_SESSION_NAME, _session_export
+@app.get("/debug/measure")
+async def debug_measure():
+    from tmux_session import _current_session_id, _capture_pane_full_history, _opencode_cli, get_latest_response
 
     oc_id = _current_session_id
-    tmux_alive = _active.active
+    if not oc_id:
+        return {"error": "No active OpenCode session"}
 
-    opencode_data = None
-    if oc_id:
-        opencode_data = _session_export(oc_id)
+    terminal = _capture_pane_full_history()
+    terminal_len = len(terminal)
+
+    stdout, stderr, rc = _opencode_cli("export", oc_id)
+    export_len = len(stdout) if rc == 0 and stdout else 0
+
+    fetch_result = get_latest_response(oc_id)
+    fetch_len = len(fetch_result.get("response") or "") if fetch_result.get("success") else 0
 
     return {
-        "opencode": {
-            "session_id": oc_id,
-            "export": opencode_data,
-        },
-        "tmux": {
-            "session_name": TMUX_SESSION_NAME,
-            "alive": tmux_alive,
-        },
-        "bridge": {
-            "session_id": oc_id,
-            "active": tmux_alive,
-        },
-        "workspace": wm.get_workspace(),
+        "terminal_len": terminal_len,
+        "export_len": export_len,
+        "fetch_len": fetch_len,
+        "export_rc": rc,
+        "fetch_success": fetch_result.get("success", False),
+        "session_id": oc_id,
     }

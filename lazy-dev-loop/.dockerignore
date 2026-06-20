@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.idea/
+*.iml
+**/__pycache__/
+**/*.pyc
+.git/
+.gitignore
+README.md
+docs/
+extension/
+.env
+*.bat
