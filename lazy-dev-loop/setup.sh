@@ -53,17 +53,14 @@ if [ ! -f .env ]; then
     if [ -f .env.example ]; then
         cp .env.example .env
         info "Created .env from .env.example"
-        warn "  >> Edit .env and set OPENAI_API_KEY=sk-... before using OpenCode"
     else
         info "Creating minimal .env..."
         cat > .env << EOF
-OPENAI_API_KEY=
 BRIDGE_PORT=7777
 RUN_TIMEOUT=120
 DEBUG_OUTPUT=true
 TMUX_SESSION_NAME=lazy-dev-loop
 EOF
-        warn "  >> Edit .env and set OPENAI_API_KEY=sk-..."
     fi
 else
     info ".env already exists."

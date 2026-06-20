@@ -145,9 +145,15 @@ def _create_session(timeout: int = 120, cwd: str | None = None) -> str | None:
             except json.JSONDecodeError:
                 _dbg(f"_create_session: non-JSON line: {line[:200]!r}")
                 continue
-            if event.get("type") == "step_start":
-                return event.get("sessionID")
-        _dbg("_create_session: no step_start found in output")
+            sid = event.get("sessionID")
+            etype = event.get("type")
+            if etype == "step_start" and sid:
+                return sid
+            if etype == "error" and sid:
+                err_msg = str(event.get("error", {}).get("data", {}).get("message", ""))
+                _dbg(f"_create_session: session {sid} created but API error: {err_msg}")
+                return sid
+        _dbg("_create_session: no sessionID found in output")
         return None
     except subprocess.TimeoutExpired:
         _dbg(f"_create_session: timed out after {timeout}s")
