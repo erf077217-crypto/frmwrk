@@ -13,12 +13,27 @@ _persistence_dir = Path(config.PERSISTENCE_DIR)
 WORKSPACE_FILE = _persistence_dir / "workspace.json"
 
 
+def _debug_log(msg: str):
+    print(f"[DIAG workspace_manager] {msg}", flush=True)
+
+
+def _in_docker() -> bool:
+    """Detect whether we're running inside a Docker container by checking for /host mount."""
+    return os.path.isdir(_host_prefix)
+
+
 def _host_to_container(host_path: str) -> str:
-    """Convert a host path to a container-local path by prepending the mount prefix."""
+    """Convert a host path to a container-local path by prepending the mount prefix.
+
+    Inside Docker (where /host mount exists), prepend /host/ to the path.
+    Outside Docker, return the path as-is for direct host filesystem access.
+    """
     path = host_path.strip().strip('"').strip("'")
     if path.startswith(_host_prefix):
         return path
-    return f"{_host_prefix}{path}"
+    if _in_docker():
+        return f"{_host_prefix}{path}"
+    return path
 
 
 def _container_to_host(container_path: str) -> str:
@@ -32,10 +47,14 @@ def set_workspace(path: str) -> dict:
     host_path = path.strip().strip('"').strip("'")
     container_path = _host_to_container(host_path)
 
+    _debug_log(f"set_workspace({path!r}) → host={host_path!r} container={container_path!r} in_docker={_in_docker()}")
+
     result = platform.run(
         f'test -d {shlex.quote(container_path)} && echo OK || echo NOT_FOUND',
         timeout=10,
     )
+    _debug_log(f"  test -d {shlex.quote(container_path)} → {result.stdout.strip()!r}")
+
     if "OK" not in result.stdout.strip():
         return {"success": False, "error": f"Directory not found or inaccessible: {host_path}"}
 
@@ -45,6 +64,7 @@ def set_workspace(path: str) -> dict:
         WORKSPACE_FILE.write_text(json.dumps(data, indent=2), encoding='utf-8')
     except (OSError, PermissionError) as e:
         return {"success": False, "error": f"Cannot save workspace: {e}"}
+    _debug_log(f"  saved workspace={container_path!r}")
     return {"success": True, "workspace": host_path}
 
 
@@ -54,9 +74,11 @@ def get_workspace() -> dict:
             data = json.loads(WORKSPACE_FILE.read_text(encoding='utf-8'))
             container_path = data.get("workspace")
             if container_path:
+                _debug_log(f"  get_workspace() → {container_path!r}")
                 return {"workspace": container_path}
         except (json.JSONDecodeError, KeyError, OSError):
             pass
+    _debug_log(f"  get_workspace() → None (file={WORKSPACE_FILE.exists()})")
     return {"workspace": None}
 
 
@@ -65,5 +87,8 @@ def get_workspace_display() -> dict:
     raw = get_workspace()
     container_path = raw.get("workspace")
     if container_path:
-        return {"workspace": _container_to_host(container_path)}
+        display = _container_to_host(container_path)
+        _debug_log(f"  get_workspace_display() → {display!r} (container was {container_path!r})")
+        return {"workspace": display}
+    _debug_log(f"  get_workspace_display() → None")
     return {"workspace": None}

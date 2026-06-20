@@ -25,6 +25,7 @@ RUN useradd -m -u 1000 app && \
     mkdir -p /home/app/.local/share/opencode && \
     mkdir -p /home/app/.config/opencode && \
     mkdir -p /home/app/.cache/opencode && \
+    mkdir -p /home/app/.local/share/lazy-dev-loop && \
     chown -R app:app /home/app
 
 USER app
