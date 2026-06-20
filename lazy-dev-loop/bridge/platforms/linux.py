@@ -1,3 +1,4 @@
+import os
 import shlex
 import shutil
 import subprocess
@@ -42,17 +43,28 @@ class LinuxPlatform:
             return False
 
     def open_terminal(self, session_name: str) -> dict:
+        # Try to find the container name from the hostname
+        hostname = os.uname().nodename
+        cmd = f"docker exec -it {hostname} tmux attach -t {shlex.quote(session_name)}"
         return {
             "success": False,
+            "need_terminal": True,
+            "command": cmd,
             "error": (
-                "This feature requires a desktop terminal emulator.\n\n"
-                "In Docker, attach to the running tmux session with:\n\n"
-                f"  docker exec -it lazy-dev-loop-bridge tmux attach -t {session_name}\n\n"
-                "Or find the container name with:\n"
-                "  docker ps\n"
-                "Then replace 'lazy-dev-loop-bridge' with the actual container name."
+                "In Docker, attach to the running tmux session by running the "
+                "command below in a terminal."
             ),
         }
+
+    def to_exec_path(self, host_path: str) -> str:
+        return host_path
+
+    def to_host_path(self, exec_path: str) -> str:
+        return exec_path
+
+    @property
+    def env_not_found_message(self) -> str:
+        return "Shell execution environment not available. Ensure bash is installed."
 
     def to_exec_path(self, host_path: str) -> str:
         return host_path

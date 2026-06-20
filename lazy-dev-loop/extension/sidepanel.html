@@ -280,6 +280,12 @@
   <!-- Terminal -->
   <section>
     <button class="accent" id="openTerminalBtn" disabled style="width:100%;">Open Terminal</button>
+    <div id="terminalCmdRow" class="hidden" style="margin-top:6px;">
+      <div style="display:flex;gap:4px;align-items:stretch;">
+        <code id="terminalCmd" style="flex:1;background:#11111b;border:1px solid #45475a;border-radius:4px;padding:6px 8px;font-size:11px;font-family:monospace;color:#a6e3a1;white-space:nowrap;overflow-x:auto;line-height:1.6;"></code>
+        <button id="terminalCopyBtn" class="secondary" style="padding:4px 8px;font-size:10px;flex-shrink:0;">Copy</button>
+      </div>
+    </div>
   </section>
 
 </div>

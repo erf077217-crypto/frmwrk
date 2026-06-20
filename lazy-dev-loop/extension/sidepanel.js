@@ -380,16 +380,33 @@ async function openTerminal() {
   try {
     const r = await fetch(`${BRIDGE}/terminal/open`, { method: "POST" });
     const data = await r.json();
-    setStatus(
-      data.success ? "Terminal launched" : `Error: ${data.error}`,
-      data.success ? "status-ok" : "status-err",
-    );
+    if (data.need_terminal) {
+      document.getElementById("terminalCmd").textContent = data.command;
+      document.getElementById("terminalCmdRow").classList.remove("hidden");
+      setStatus(data.error || "Run the command in a terminal", "status-warn");
+    } else if (data.success) {
+      setStatus("Terminal launched", "status-ok");
+    } else {
+      setStatus(`Error: ${data.error}`, "status-err");
+    }
   } catch (err) {
     setStatus(`Error: ${err.message}`, "status-err");
   }
 }
 
-openTerminalBtn.addEventListener("click", openTerminal);
+openTerminalBtn.addEventListener("click", () => {
+  document.getElementById("terminalCmdRow").classList.add("hidden");
+  openTerminal();
+});
+
+document.getElementById("terminalCopyBtn").addEventListener("click", () => {
+  const cmd = document.getElementById("terminalCmd").textContent;
+  navigator.clipboard.writeText(cmd).then(() => {
+    setStatus("Command copied", "status-ok");
+  }).catch(() => {
+    setStatus("Failed to copy", "status-err");
+  });
+});
 
 // ── Button wiring ────────────────────────────────────────────────────────
 
